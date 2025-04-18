@@ -1,0 +1,1641 @@
+const crypto = require('crypto')
+globalThis.crypto = crypto.webcrypto;
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const axios = require('axios');
+const express = require('express');
+const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
+const WebSocket = require('ws');
+const app = express();
+const NIVEL_APRENDIZADO = {
+  BASICO: { meta: 70, revisao: 24 }, // Horas entre revisões
+  INTERMEDIARIO: { meta: 80, revisao: 48 },
+  AVANCADO: { meta: 90, revisao: 72 }
+};
+
+app.use(express.json());
+
+const OPENROUTER_API_KEY = "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";
+const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzfdPVe8l1OnXHw6i6kkk3NV9gTt2-oC0sE2WLDuN6InBU1K5kopMyT07kElsCulrNY/exec';
+const GRUPOS_PERMITIDOS = [
+  '120363420675161205@g.us' // Grupo original
+];
+const USUARIOS_AUTORIZADOS = [
+  '5521975874116@s.whatsapp.net', // N1
+  '5521976919619@s.whatsapp.net' // N2
+];
+const chartJSNodeCanvas = new ChartJSNodeCanvas({
+  width: 800,
+  height: 600,
+  backgroundColour: 'white'
+});
+
+const wss = new WebSocket.Server({ port: 8080 });
+
+let ultimoComandoProcessado = null;
+
+const niveis = {
+  iniciante: [],
+  intermediario: [],
+  avancado: []
+};
+
+let progressoUsuario = {
+  nivelAtual: 'iniciante',
+  respostasCorretas: 0,
+  totalPerguntas: 0,
+  totalPerguntasDoNivel: 0
+};
+
+let estadoConversa = {};
+
+// Adicionar um controle para evitar processamentos duplicados
+let processandoRespostaFlag = false;
+let envioExplicacaoEmAndamento = {};
+
+// Função para log detalhado
+function logMensagem(msg, tipo = 'recebida') {
+  const dataHora = new Date().toISOString();
+  const remetente = msg?.pushName || 'Desconhecido';
+  const texto = msg.message?.conversation || '(mídia ou mensagem sem texto)';
+  const chatId = msg.key.remoteJid;
+  
+  console.log(`[${dataHora}] Mensagem ${tipo}:`);
+  console.log(`De: ${remetente} (${chatId})`);
+  console.log(`Texto: ${texto}`);
+  console.log('---');
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function enviarMensagemComDelay(jid, conteudo, isGroup = false) {
+  if (!conteudo?.text) {
+    console.error("⚠️ Tentativa de enviar mensagem sem texto!");
+    conteudo = { text: "❌ Ocorreu um erro inesperado" }; // Fallback
+  }
+  await delay(1000);
+  if (isGroup) {
+    await sock.sendMessage(jid, conteudo, { quoted: null });
+  } else {
+    await sock.sendMessage(jid, conteudo);
+  }
+}
+
+let ultimoComandoUsuario = { jid: null, timestamp: 0 }; // Renomeada para mais clareza
+
+async function processarComando(jid, texto) {
+  // Ignora mensagens do próprio bot
+  if (texto.includes("⏳ Aguarde") || texto.includes("❌ Erro")) {
+    return null;
+  }
+
+  const agora = Date.now();
+  if (ultimoComandoUsuario.jid === jid && (agora - ultimoComandoUsuario.timestamp) < 2000) {
+    return "⏳ Aguarde 2 segundos antes de outro comando.";
+  }
+  
+  ultimoComandoUsuario = { jid, timestamp: agora };
+  return null;
+}
+
+// Lista de comandos para o comando "ajuda"
+const LISTA_DE_COMANDOS = `
+📚 *Lista de Comandos de Estudo* 📚
+
+📅 *Agendamento*
+- estudar [matéria]: Inicia/retoma estudos de uma matéria
+- agendar [matéria] [data] [hora]: Agenda um bloco de estudo
+- cronograma: Mostra sua agenda de estudos
+- concluir [id]: Marca sessão como concluída
+
+📝 *Anotações*
+- anotar [matéria] [texto]: Adiciona uma anotação
+- anotações [matéria]: Lista anotações de uma matéria
+- buscar [termo]: Busca em todas anotações
+
+🔄 *Revisão*
+- flashcard [matéria]: Mostra um flashcard para revisão
+- responder [resposta]: Responde o flashcard atual
+- estatísticas: Mostra desempenho nos flashcards
+
+📊 *Acompanhamento*
+- metas: Mostra suas metas de estudo
+- definir meta [matéria] [horas]: Define meta semanal
+- progresso: Mostra progresso nas matérias
+
+📋 *Avaliações*
+- prova [matéria] [data]: Agenda uma prova
+- simulado [tipo] [data]: Agenda simulado
+- resultados: Mostra desempenho em avaliações
+
+🔧 *Ajuda*
+- ajuda: Mostra esta lista de comandos
+`;
+
+// Adicionando logs mais detalhados para erros
+function logErroDetalhado(erro) {
+  console.error("❌ Erro Detalhado:", erro.message);
+  if (erro.response) {
+    console.error("Status:", erro.response.status);
+    console.error("Dados da resposta:", erro.response.data);
+  }
+  console.error("Stack:", erro.stack);
+}
+
+// Função auxiliar para chamar a API OpenRouter com retries e tratamento de erro
+async function chamarOpenRouter(prompt, isJsonOutput = false) {
+  console.log(`🤖 Chamando OpenRouter. JSON esperado: ${isJsonOutput}`);
+  let tentativas = 0;
+  const maxTentativas = 3; // Reduzido para 3 tentativas
+
+  while (tentativas < maxTentativas) {
+    try {
+      console.time("Tempo de resposta OpenRouter");
+      const requestBody = {
+        model: 'deepseek/deepseek-chat-v3-0324:free',
+        messages: [{ role: 'user', content: prompt }],
+      };
+      if (isJsonOutput) {
+        requestBody.response_format = { type: "json_object" };
+      }
+
+      const resposta = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        requestBody,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+            'HTTP-Referer': 'http://localhost',
+            'X-Title': 'Bot de Estudos'
+          },
+          timeout: 15000 // Aumentado para 15 segundos para geração de conteúdo
+        }
+      );
+      console.timeEnd("Tempo de resposta OpenRouter");
+
+      if (!resposta.data?.choices?.[0]?.message?.content) {
+        throw new Error("Resposta da API em formato inválido ou vazia.");
+      }
+
+      console.log("💬 Resposta bruta da OpenRouter:", resposta.data.choices[0].message.content);
+      return resposta.data.choices[0].message.content;
+
+    } catch (error) {
+      console.timeEnd("Tempo de resposta OpenRouter");
+      tentativas++;
+      logErroDetalhado(error); // Usa a função de log detalhado existente
+
+      if (error.response?.status === 429) {
+        console.error("🚫 Limite de requisições excedido na OpenRouter.");
+        throw new Error("Limite de requisições excedido. Tente novamente mais tarde."); // Relança o erro
+      }
+      
+      if (tentativas >= maxTentativas) {
+         console.error(`🚫 Falha ao chamar OpenRouter após ${maxTentativas} tentativas.`);
+         throw new Error("Falha ao gerar conteúdo após múltiplas tentativas."); // Relança o erro
+      }
+
+      console.log(`⏳ Tentando novamente em 2 segundos (Tentativa ${tentativas})...`);
+      await delay(2000);
+    }
+  }
+}
+
+async function criarMateria(nome) {
+  console.log("📚 Criando nova matéria:", nome);
+  try {
+    const nomeLimpo = nome.replace(/[^\w\s]/g, '').trim();
+    const response = await chamarOpenRouter(`Crie um plano de ensino em JSON para "${nomeLimpo}" com 3 níveis. Inclua tópicos e recursos.`, true);
+
+    // Verificação rigorosa da resposta
+    if (!response || response.status === 'error') {
+      throw new Error(response?.message || "Resposta inválida da API");
+    }
+
+    return response.message || "✅ Matéria criada com sucesso!"; // Fallback
+  } catch (error) {
+    console.error("❌ Erro ao criar matéria:", error);
+    return error.message || "❌ Erro desconhecido ao criar matéria"; // Garante string
+  }
+}
+
+async function agendarSessao(materia, data, hora, duracao = "", topico = "") {
+  return await chamarOpenRouter(`Agende um bloco de estudo para "${materia}" no dia "${data}" às "${hora}". Se necessário, especifique um tópico ou duração adicional.`, true);
+}
+
+async function adicionarAnotacao(materia, topico, texto, tags = "") {
+  return await chamarOpenRouter(`Adicione uma anotação sobre "${materia}" no tópico "${topico}". Anote o texto: "${texto}". Se necessário, adicione tags: "${tags}".`, true);
+}
+
+async function criarFlashcard(materia, pergunta, resposta) {
+  return await chamarOpenRouter(`Crie um flashcard para "${materia}" com a pergunta: "${pergunta}" e a resposta: "${resposta}".`, true);
+}
+
+async function definirMeta(materia, horas, data_limite) {
+  return await chamarOpenRouter(`Defina uma meta de estudo para "${materia}" de ${horas} horas até "${data_limite}".`, true);
+}
+
+async function registrarAvaliacao(materia, tipo, data, resultado, topicos) {
+  return await chamarOpenRouter(`Registre o resultado da avaliação "${tipo}" para "${materia}" no dia "${data}". O resultado foi "${resultado}". Se necessário, adicione comentários sobre os tópicos: "${topicos}".`, true);
+}
+
+async function atualizarProgresso(materia_id, progresso) {
+  return await chamarOpenRouter(`Atualize o progresso de "${materia_id}" para ${progresso}%.`, true);
+}
+
+async function alterarStatus(materia_id, status) {
+  return await chamarOpenRouter(`Altere o status de "${materia_id}" para "${status}".`, true);
+}
+
+async function obterInfoMateria(materia_id) {
+  return await chamarOpenRouter(`Forneça informações sobre "${materia_id}".`, true);
+}
+
+// Função de fallback para interpretação manual
+function interpretarMensagemManual(texto) {
+  console.log("\n🔄 Usando interpretação manual para:", texto);
+  
+  const textoLower = texto.toLowerCase();
+  
+  // Padrões para detecção de comandos
+  if (textoLower.includes("estudar") || textoLower.includes("quero estudar") || textoLower.includes("vou estudar") || textoLower.includes("iniciar")) {
+    // Extrai a matéria após a palavra "estudar" ou variações
+    const materia = texto.split(/estudar|quero estudar|vou estudar|iniciar/i)[1]?.trim();
+    if (materia) {
+      console.log("📚 Matéria extraída:", materia);
+      // Inicia o processo de criação de um plano de ensino
+      return {
+        comando: "estudar",
+        parametros: { materia }
+      };
+    }
+  }
+  
+  console.log("⚠️ Nenhum comando reconhecido");
+  return null;
+}
+
+// Adicionar esta função para detectar mensagens de sistema
+function isMensagemSistema(texto) {
+  // Padrões que identificam mensagens do sistema
+  const padroesDoSistema = [
+    /^progresso atual:/i,
+    /^você atingiu [0-9.]+% de acertos/i,
+    /^vamos recomeçar as perguntas/i,
+    /^parabéns!/i,
+    /^⚠️ não entendi qual comando/i,
+    /^correto!/i,
+    /^incorreto\./i
+  ];
+  
+  return padroesDoSistema.some(padrao => padrao.test(texto));
+}
+
+// Modifique a verificação na função pareceSerComandoEstudo para excluir mensagens de sistema
+function pareceSerComandoEstudo(texto) {
+  // Se for uma mensagem do sistema, retornar false imediatamente
+  if (isMensagemSistema(texto)) {
+    console.log("[pareceSerComandoEstudo] Mensagem do sistema detectada, ignorando como comando.");
+    return false;
+  }
+
+  const palavrasChave = [
+    "estudar", "aprender", "matéria", "agendar", "cronograma",
+    "anotar", "anotações", "flashcard", "responder", "prova",
+    "simulado", "meta", "metas", "progresso", "revisar",
+    "concluir", "buscar", "estatísticas", "resultados",
+    "iniciar",
+    "ensinar"
+  ];
+  
+  const textoLower = texto.toLowerCase();
+  
+  // Verifica se contém alguma palavra-chave
+  const temPalavraChave = palavrasChave.some(palavra => 
+    textoLower.includes(palavra.toLowerCase())
+  );
+  
+  // Verifica se começa com "estudar" ou variações (incluindo "ensinar" agora implicitamente via palavrasChave)
+  const comecaComComando = /^(estudar|quero estudar|vou estudar|iniciar|ensinar)/i.test(textoLower);
+
+  // Logs internos para depuração
+  console.log(`[pareceSerComandoEstudo] Texto: "${textoLower}"`);
+  console.log(`[pareceSerComandoEstudo] Tem Palavra Chave? ${temPalavraChave}`);
+  console.log(`[pareceSerComandoEstudo] Começa com Comando? ${comecaComComando}`);
+  
+  const resultado = temPalavraChave || comecaComComando;
+  console.log(`[pareceSerComandoEstudo] Resultado: ${resultado}`);
+  return resultado;
+}
+
+// Função principal do bot
+let sock = null;
+
+async function iniciarConexaoWhatsApp() {
+  console.log('Iniciando conexão WhatsApp...');
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  console.log('Estado da autenticação:', state ? 'OK' : 'FALHA');
+  
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+    browser: ['Bot de Estudos', 'Chrome', '115.0.0.0'],
+    syncFullHistory: false
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Conexão fechada devido a ', lastDisconnect.error, ', reconectando:', shouldReconnect);
+      if (shouldReconnect) {
+        setTimeout(() => {
+          console.log('Tentando reconectar...');
+          iniciarConexaoWhatsApp();
+        }, 3000);
+      }
+    } else if (connection === 'open') {
+      console.log('✅ Conexão estabelecida com sucesso!');
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg?.message || !msg.key?.remoteJid) return;
+
+    // Extrair o texto da mensagem para verificação
+    const texto = msg.message.conversation?.trim() || msg.message.extendedTextMessage?.text?.trim() || "";
+
+    // IMPORTANTE: Lógica revisada para permitir mensagens enviadas pelo mesmo número
+    // 1. Verifica se a mensagem contém padrões típicos de mensagens do bot
+    const isBotResponse = 
+      (texto.startsWith('❓') || 
+       texto.startsWith('📖') ||
+       texto.startsWith('Incorreto') ||
+       texto.startsWith('Correto!') ||
+       texto.startsWith('Progresso atual:') ||
+       texto.startsWith('Você atingiu'));
+
+    // 2. Se for do próprio número mas não parecer uma mensagem automática do bot,
+    //    provavelmente é uma mensagem manual do usuário que devemos processar
+    if (msg.key.fromMe && !isBotResponse && !isMensagemSistema(texto)) {
+      // Esta é possivelmente uma mensagem manual do usuário usando o mesmo número
+      console.log('📱 Mensagem enviada manualmente do mesmo número do bot. Processando normalmente.');
+    } 
+    // 3. Se for uma mensagem automática do bot ou mensagem de sistema, ignoramos
+    else if (msg.key.fromMe || isMensagemSistema(texto)) {
+      console.log('⚠️ Mensagem automática do bot ou mensagem de sistema. Ignorando para evitar loops.');
+      return;
+    }
+    
+    // Permite que comandos manuais do usuário sejam processados
+    const isUserCommand = pareceSerComandoEstudo(texto);
+
+    // Verificar se o usuário tem um estado de conversa ativo
+    const temEstadoAtivo = estadoConversa[msg.key.remoteJid] !== undefined;
+    
+    console.log('\n=== NOVA MENSAGEM RECEBIDA ===');
+    console.log('📱 Remetente:', msg.pushName || 'Desconhecido');
+    console.log('🔑 Chat ID:', msg.key.remoteJid);
+    console.log('🔑 Participant:', msg.key.participant);
+    console.log('🔑 fromMe:', msg.key.fromMe);
+    console.log('💬 Texto:', texto);
+    console.log('🔑 Estado de conversa ativo:', temEstadoAtivo);
+    
+    // Ignora mensagens de status
+    if (msg.key.remoteJid === 'status@broadcast') {
+      console.log('⚠️ Mensagem de status ignorada');
+      return;
+    }
+
+    // Adiciona logs de depuração para verificar o identificador do usuário
+    console.log('🔍 Verificando usuário JID:', msg.key.remoteJid);
+    console.log('🔍 Usuários autorizados:', USUARIOS_AUTORIZADOS);
+
+    const isGrupoValido = GRUPOS_PERMITIDOS.includes(msg.key.remoteJid);
+    const isUsuarioValido = USUARIOS_AUTORIZADOS.includes(msg.key.remoteJid);
+      
+    console.log('🔒 Verificações Iniciais:');
+    console.log('- Grupo válido:', isGrupoValido);
+    console.log('- Usuário válido:', isUsuarioValido);
+      
+    if (!isGrupoValido && !isUsuarioValido) {
+      console.log('❌ Chat/Usuário não autorizado:', msg.key.remoteJid);
+      return;
+    }
+    
+    console.log('✅ Verificações de autorização e bot passadas.');
+    
+    // Verifica se é uma resposta a uma pergunta anterior (conversa ativa)
+    if (temEstadoAtivo && !isUserCommand) {
+      console.log('🧠 Resposta a pergunta detectada. Processando resposta...');
+      await processarResposta(msg.key.remoteJid, texto, isGrupoValido);
+      return;
+    }
+    
+    // Resto da lógica de processamento
+    const textoLower = texto.toLowerCase();
+    console.log('🚦 Texto em minúsculas:', textoLower);
+
+    if (textoLower === 'ajuda') {
+      console.log('📚 Comando "ajuda" detectado. Enviando lista...');
+      await enviarMensagemComDelay(msg.key.remoteJid, { text: LISTA_DE_COMANDOS }, isGrupoValido);
+      console.log('📚 Lista de comandos enviada. Saindo do processamento.');
+      return;
+    }
+
+    console.log('🚦 Comando não é "ajuda". Prosseguindo...');
+    console.log('🧠 Verificando se é comando de estudo...');
+
+    if (pareceSerComandoEstudo(texto)) {
+      console.log('📚 Processando comando de estudo:', texto);
+      
+      // Interpretação do comando (SIMPLIFICADA - pode precisar refinar)
+      let comando = null;
+      let materia = null;
+      if (textoLower.startsWith('estudar') || textoLower.startsWith('ensinar') || textoLower.startsWith('iniciar')) {
+          comando = 'estudar';
+          // Extrai a matéria após o comando
+          materia = texto.split(/^(?:estudar|ensinar|iniciar)\s+/i)[1]?.trim(); 
+      } else if (textoLower.startsWith('criar plano')) { // Exemplo de outro comando
+          comando = 'criar_plano_ensino';
+          materia = texto.split(/^(?:criar plano)\s+/i)[1]?.trim();
+      }
+      // Adicionar mais lógicas if/else if para outros comandos (agendar, anotar, etc.)
+
+      if (!comando || !materia) {
+           console.log('⚠️ Não foi possível extrair comando/matéria válidos da mensagem:', texto);
+           await enviarMensagemComDelay(msg.key.remoteJid, { text: "⚠️ Não entendi qual comando ou matéria você quer. Ex: 'ensinar física quântica'" }, isGrupoValido);
+        return;
+      }
+
+      console.log(`💡 Comando interpretado: ${comando}, Matéria: ${materia}`);
+
+        let response;
+        try {
+        console.log(`⚡ Executando comando: ${comando}`);
+        switch (comando) {
+          case 'estudar': // 'ensinar' e 'iniciar' também caem aqui
+            estadoConversa[msg.key.remoteJid] = { nivelAtual: 'iniciante', indicePergunta: 0 };
+            await ensinarMateria(materia, msg.key.remoteJid, isGrupoValido);
+            return;
+          case 'criar_plano_ensino':
+            response = await criarPlanoEnsino(materia);
+              break;
+          // ... Adicionar outros cases conforme necessário ...
+            default:
+            response = "❌ Comando não reconhecido internamente. Use 'ajuda'.";
+        }
+
+        // Validação e formatação da resposta (lógica existente)
+        if (typeof response !== 'string') {
+          console.error("Resposta inválida para envio:", response);
+          if (typeof response === 'object' && response !== null) {
+            if (response.explicacao && response.perguntas) {
+              let textoResposta = `📖 ${response.explicacao}\n\n`;
+              textoResposta += `❓ Perguntas Nível ${progressoUsuario.nivelAtual}:\n`;
+              response.perguntas.forEach((p, index) => {
+                textoResposta += `${index + 1}. ${p.pergunta}\n`;
+              });
+              response = textoResposta;
+            } else {
+              response = "❌ Erro: Resposta interna em formato inesperado.";
+            }
+          } else {
+            response = "❌ Erro inesperado no processamento do comando.";
+          }
+        }
+
+        console.log('📤 Enviando resposta formatada:', response);
+        await enviarMensagemComDelay(msg.key.remoteJid, { text: response }, isGrupoValido);
+
+      } catch (error) {
+        console.error('❌ Erro ao processar comando específico:', error);
+        // Envia a mensagem de erro da exceção, se houver, caso contrário, uma genérica
+        const errorMsg = error.message || "Ocorreu um erro ao processar seu comando. Tente novamente.";
+        await enviarMensagemComDelay(msg.key.remoteJid, { 
+          text: `❌ ${errorMsg}` 
+        }, isGrupoValido);
+      }
+
+    } else if (temEstadoAtivo) {
+      console.log('🔄 Estado de conversa ativo detectado. Processando resposta...');
+      const estado = estadoConversa[msg.key.remoteJid];
+      const perguntas = niveis[estado.nivelAtual];
+      
+      if (!perguntas || perguntas.length === 0) {
+        console.error('Perguntas não encontradas para o nível:', estado.nivelAtual);
+        await enviarMensagemComDelay(msg.key.remoteJid, { text: 'Houve um problema ao recuperar as perguntas. Por favor, inicie um novo estudo.' }, isGrupoValido);
+        delete estadoConversa[msg.key.remoteJid];
+        return;
+      }
+
+      // Verifica se já respondeu todas as perguntas
+      if (estado.indicePergunta >= perguntas.length) {
+        console.log(`✅ Todas as perguntas do nível ${estado.nivelAtual} já foram respondidas`);
+        const progresso = verificarProgresso();
+        await enviarMensagemComDelay(msg.key.remoteJid, { text: progresso }, isGrupoValido);
+        
+        // Se não avançou de nível, reinicia as perguntas
+        if (progressoUsuario.nivelAtual === estado.nivelAtual) {
+          estado.indicePergunta = 0;
+          await enviarMensagemComDelay(msg.key.remoteJid, { text: 'Vamos recomeçar as perguntas deste nível para você melhorar seu desempenho.' }, isGrupoValido);
+          await delay(1000);
+          await enviarProximaPergunta(msg.key.remoteJid, isGrupoValido);
+        } else {
+          // Se avançou, prepara uma nova explicação
+          const novoNivel = progressoUsuario.nivelAtual;
+          try {
+            await enviarMensagemComDelay(msg.key.remoteJid, { text: `🎉 Parabéns! Você avançou para o nível ${novoNivel}. Preparando nova explicação...` }, isGrupoValido);
+            
+            const materia = estado.materia;
+            const explicacao = await gerarExplicacao(materia, novoNivel);
+            await enviarMensagemComDelay(msg.key.remoteJid, { text: `📖 ### **${materia} – ${novoNivel.toUpperCase()}**\n\n${explicacao}` }, isGrupoValido);
+            
+            // Atualiza o estado para o novo nível
+            estado.nivelAtual = novoNivel;
+            estado.indicePergunta = 0;
+            
+            // Envia a primeira pergunta do novo nível
+            await delay(2000);
+            await enviarProximaPergunta(msg.key.remoteJid, isGrupoValido);
+          } catch (error) {
+            console.error(`❌ Erro ao avançar para novo nível:`, error);
+            await enviarMensagemComDelay(msg.key.remoteJid, { text: `Houve um problema ao avançar para o nível ${novoNivel}. Por favor, reinicie o estudo.` }, isGrupoValido);
+          }
+        }
+        return;
+      }
+
+      const perguntaAtual = perguntas[estado.indicePergunta];
+      if (!perguntaAtual) {
+        console.error('Pergunta atual não encontrada para:', msg.key.remoteJid);
+        return;
+      }
+      
+      console.log('🧠 Verificando resposta para:', perguntaAtual.pergunta);
+      console.log('🧠 Resposta do usuário:', texto);
+      console.log('🧠 Resposta correta:', perguntaAtual.respostaCorreta);
+      
+      const resposta = verificarResposta(perguntaAtual, texto);
+      await enviarMensagemComDelay(msg.key.remoteJid, { text: resposta }, isGrupoValido);
+
+      // Avança para a próxima pergunta independentemente se acertou ou não
+      estado.indicePergunta++;
+      
+      // Verifica se já respondeu todas as perguntas do nível atual para dar o progresso
+      // CORREÇÃO: Removendo esta verificação aqui, só verificará quando terminar todas as perguntas
+      // O progresso intermediário será mostrado junto com a próxima pergunta
+      console.log(`📊 Progresso atual: ${progressoUsuario.respostasCorretas}/${progressoUsuario.totalPerguntas} (${(progressoUsuario.respostasCorretas/progressoUsuario.totalPerguntas*100).toFixed(1)}%)`);
+      
+      // Se ainda tem mais perguntas no nível atual, envia a próxima
+      if (estado.indicePergunta < perguntas.length) {
+        await enviarProximaPergunta(msg.key.remoteJid, isGrupoValido);
+      } else {
+        // Se já respondeu todas, finaliza o nível e verifica se pode avançar
+        console.log(`✅ Todas as perguntas do nível ${estado.nivelAtual} foram respondidas`);
+        const progresso = verificarProgresso();
+        await enviarMensagemComDelay(msg.key.remoteJid, { text: progresso }, isGrupoValido);
+        
+        // Se não avançou de nível, reinicia as perguntas
+        if (progressoUsuario.nivelAtual === estado.nivelAtual) {
+          estado.indicePergunta = 0;
+          await enviarMensagemComDelay(msg.key.remoteJid, { text: 'Vamos recomeçar as perguntas deste nível para você melhorar seu desempenho.' }, isGrupoValido);
+          await delay(1000);
+          await enviarProximaPergunta(msg.key.remoteJid, isGrupoValido);
+        } else {
+          // Se avançou, prepara uma nova explicação
+          const novoNivel = progressoUsuario.nivelAtual;
+          try {
+            await enviarMensagemComDelay(msg.key.remoteJid, { text: `🎉 Parabéns! Você avançou para o nível ${novoNivel}. Preparando nova explicação...` }, isGrupoValido);
+            
+            const materia = estado.materia;
+            const explicacao = await gerarExplicacao(materia, novoNivel);
+            await enviarMensagemComDelay(msg.key.remoteJid, { text: `📖 ### **${materia} – ${novoNivel.toUpperCase()}**\n\n${explicacao}` }, isGrupoValido);
+            
+            // Atualiza o estado para o novo nível
+            estado.nivelAtual = novoNivel;
+            estado.indicePergunta = 0;
+            
+            // Envia a primeira pergunta do novo nível
+            await delay(2000);
+            await enviarProximaPergunta(msg.key.remoteJid, isGrupoValido);
+          } catch (error) {
+            console.error(`❌ Erro ao avançar para novo nível:`, error);
+            await enviarMensagemComDelay(msg.key.remoteJid, { text: `Houve um problema ao avançar para o nível ${novoNivel}. Por favor, reinicie o estudo.` }, isGrupoValido);
+          }
+        }
+      }
+    } else {
+      console.log('⚠️ Comando não parece ser de estudo e não há estado de conversa ativo:', texto);
+    }
+  });
+}
+
+// Função para criar um plano de ensino
+async function criarPlanoEnsino(materia) {
+  try {
+    // Chamar LLM para gerar plano (exemplo com DeepSeek)
+    const prompt = `Crie um plano de ensino em JSON para "${materia}" com 3 níveis. Inclua tópicos e recursos.`;
+    let respostaLLM;
+    let tentativas = 0;
+    const maxTentativas = 5; // Aumentar o número de tentativas
+
+    while (tentativas < maxTentativas) {
+      try {
+        console.time("Tempo de resposta da API"); // Inicia o cronômetro para medir o tempo de resposta
+        respostaLLM = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: 'deepseek/deepseek-chat-v3-0324:free',
+            response_format: { type: "json_object" }, // Solicita resposta JSON
+            messages: [
+              {
+                role: 'user',
+                content: prompt
+              }
+            ],
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+              'HTTP-Referer': 'http://localhost',
+              'X-Title': 'Bot de Estudos'
+            },
+            timeout: 10000 // Mantém o timeout de 10 segundos
+          }
+        );
+        console.timeEnd("Tempo de resposta da API"); // Finaliza o cronômetro e exibe o tempo de resposta
+        break; // Sai do loop se a solicitação for bem-sucedida
+      } catch (error) {
+        console.timeEnd("Tempo de resposta da API"); // Finaliza o cronômetro em caso de erro
+        tentativas++;
+        console.error(`❌ Erro ao chamar API (tentativa ${tentativas}):`, error);
+        if (error.response?.status === 429) {
+          console.error("❌ Limite de requisições excedido. Tente novamente mais tarde.");
+          return "❌ Limite de requisições excedido. Tente novamente mais tarde.";
+        }
+        if (tentativas >= maxTentativas || (error.response?.status !== 502 && !error.response?.data?.choices?.[0]?.error?.metadata?.raw?.retryable)) {
+          console.log("🔄 Usando interpretação manual para continuar o processamento.");
+          return criarPlanoBasico(materia); // Usa interpretação manual para criar um plano básico
+        }
+        await delay(2000); // Espera 2 segundos antes de tentar novamente
+      }
+    }
+
+    // Adiciona log para capturar a resposta completa
+    console.log("📥 Resposta completa da LLM:", JSON.stringify(respostaLLM.data, null, 2));
+    console.log("📥 Tipo de conteúdo:", respostaLLM.headers['content-type']);
+
+    // Verifica se a resposta é do tipo esperado
+    if (!respostaLLM.headers['content-type'].includes('application/json')) {
+      console.error("❌ Resposta não é JSON:", respostaLLM.data);
+      return criarPlanoBasico(materia); // Retorna plano básico se a resposta não for JSON
+    }
+
+    // Tenta extrair e analisar a parte JSON da resposta
+    let plano;
+    try {
+      const messageContent = respostaLLM.data.choices[0].message.content;
+      console.log("📥 Conteúdo da mensagem:", messageContent);
+      const jsonMatch = messageContent.match(/\{[^]*\}/);
+      if (!jsonMatch) {
+        console.error("❌ JSON não encontrado na resposta:", messageContent);
+        return criarPlanoBasico(materia); // Retorna plano básico se JSON não for encontrado
+      }
+      plano = JSON.parse(jsonMatch[0]);
+    } catch (jsonError) {
+      console.error("❌ Erro ao analisar JSON:", jsonError);
+      return criarPlanoBasico(materia); // Retorna plano básico se houver erro ao analisar JSON
+    }
+    
+    // Verifica se o plano possui níveis e tópicos
+    if (!plano.plano_ensino || !plano.plano_ensino.niveis || plano.plano_ensino.niveis.length === 0) {
+      return criarPlanoBasico(materia); // Retorna plano básico se a estrutura estiver incompleta
+    }
+
+    for (const nivel of plano.plano_ensino.niveis) {
+      if (!nivel.topicos || nivel.topicos.length === 0) {
+        return criarPlanoBasico(materia); // Retorna plano básico se algum nível não tiver tópicos
+      }
+    }
+
+    // Registrar no Google Sheets
+    const response = await chamarOpenRouter(`Registre o plano de ensino para "${materia}" com os dados: ${JSON.stringify(plano)} e o prazo: ${new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()}`, true);
+
+    return `📘 Plano criado! Primeiro tópico: ${plano.plano_ensino.niveis[0].topicos[0]}
+Recursos: ${plano.plano_ensino.niveis[0].recursos.join(", ")}`;
+  } catch (error) {
+    return criarPlanoBasico(materia); // Retorna plano básico em caso de erro geral
+  }
+}
+
+// Função para criar um plano básico quando a API falhar
+function criarPlanoBasico(materia) {
+  console.log("🔄 Criando plano básico para:", materia);
+  return `📘 Plano básico criado para ${materia}. Primeiro tópico: Introdução ao ${materia}`;
+}
+
+async function agendarRevisao(materiaId, tópico) {
+  const agenda = planilha.getSheetByName("Histórico");
+  agenda.appendRow([
+    materiaId,
+    `Revisão programada: ${tópico}`,
+    new Date(Date.now() + NIVEL_APRENDIZADO.BASICO.revisao * 60 * 60 * 1000)
+  ]);
+}
+
+async function buscarProximoTópico(materiaId) {
+  const response = await chamarOpenRouter(`Forneça o próximo tópico para "${materiaId}"`, true);
+  return response.data;
+}
+
+// Função para gerar um identificador único
+function gerarIdUnico() {
+  return 'id-' + Math.random().toString(36).substr(2, 9);
+}
+
+async function ensinarMateria(materia, jid, isGroup) {
+  console.log(`📚 Iniciando processo de ensinar: ${materia}`);
+  if (!materia || materia.trim() === "") {
+      return "❌ Por favor, especifique a matéria que você quer aprender. Ex: ensinar história do Brasil";
+  }
+  
+  try {
+    // Obter o nível atual do usuário (ou iniciar como iniciante)
+    const nivelAtual = estadoConversa[jid]?.nivelAtual || 'iniciante';
+    console.log(`📊 Nível atual do usuário: ${nivelAtual}`);
+    
+    // Gerar explicação apropriada para o nível atual
+    const explicacao = await gerarExplicacao(materia, nivelAtual);
+    console.log(`✅ Explicação gerada para o nível: ${nivelAtual}`);
+    
+    // Gerar perguntas baseadas na explicação para o nível atual
+    let perguntasNivel;
+    try {
+      perguntasNivel = await gerarPerguntas(materia, explicacao, nivelAtual);
+      console.log(`✅ Perguntas geradas para o nível: ${nivelAtual}`);
+    } catch (error) {
+      console.error(`❌ Erro ao gerar perguntas. Usando placeholders:`, error);
+      perguntasNivel = await gerarPerguntasPlaceholder(materia, nivelAtual);
+    }
+    
+    // Armazenar perguntas no nível correspondente
+    niveis[nivelAtual] = perguntasNivel;
+    
+    // Resetar contadores de progresso no início do estudo
+    progressoUsuario = {
+      nivelAtual: nivelAtual,
+      respostasCorretas: 0,
+      totalPerguntas: 0,
+      totalPerguntasDoNivel: perguntasNivel.length
+    };
+    
+    // Inicializar ou atualizar o estado da conversa
+    estadoConversa[jid] = { 
+      nivelAtual: nivelAtual, 
+      indicePergunta: 0,
+      materia: materia,
+      continuando: true // Marca que esta sessão é uma continuação
+    };
+    
+    // Enviar explicação e perguntas para o usuário
+    let response = `📖 ### **${materia} – ${nivelAtual.toUpperCase()}**\n\n${explicacao}\n\n❓ Perguntas (Nível ${nivelAtual}):\n`;
+    perguntasNivel.forEach((p, index) => {
+      response += `${index + 1}. ${p.pergunta}\n`;
+    });
+
+    await enviarMensagemComDelay(jid, { text: response }, isGroup);
+    console.log(`📤 Enviada explicação e perguntas para o nível: ${nivelAtual}`);
+
+    // Se estamos iniciando um novo estudo, gerar perguntas para os outros níveis também
+    // para tê-las prontas quando o usuário avançar
+    if (nivelAtual === 'iniciante' && (!estadoConversa[jid] || !estadoConversa[jid].continuando)) {
+      console.log(`🔄 Gerando perguntas para níveis futuros em segundo plano...`);
+      
+      // Gerar perguntas para intermediário (em background)
+      gerarExplicacao(materia, 'intermediario').then(explicIntermediario => {
+        gerarPerguntas(materia, explicIntermediario, 'intermediario').then(perguntasIntermediario => {
+          niveis.intermediario = perguntasIntermediario;
+          console.log(`✅ Perguntas para nível intermediário armazenadas em background.`);
+        }).catch(error => {
+          console.error(`❌ Erro ao gerar perguntas intermediárias em background:`, error);
+          gerarPerguntasPlaceholder(materia, 'intermediario').then(placeholders => {
+            niveis.intermediario = placeholders;
+          });
+        });
+      }).catch(error => {
+        console.error(`❌ Erro ao gerar explicação intermediária em background:`, error);
+      });
+      
+      // Gerar perguntas para avançado (em background)
+      gerarExplicacao(materia, 'avancado').then(explicAvancado => {
+        gerarPerguntas(materia, explicAvancado, 'avancado').then(perguntasAvancado => {
+          niveis.avancado = perguntasAvancado;
+          console.log(`✅ Perguntas para nível avançado armazenadas em background.`);
+        }).catch(error => {
+          console.error(`❌ Erro ao gerar perguntas avançadas em background:`, error);
+          gerarPerguntasPlaceholder(materia, 'avancado').then(placeholders => {
+            niveis.avancado = placeholders;
+          });
+        });
+      }).catch(error => {
+        console.error(`❌ Erro ao gerar explicação avançada em background:`, error);
+      });
+    }
+
+  } catch (error) { // Captura erros gerais do processo ensinarMateria
+    console.error(`❌ Erro geral ao ensinar matéria ${materia}:`, error);
+    // Retorna uma mensagem de erro que será enviada ao usuário
+    throw new Error(`Erro ao gerar conteúdo de estudo para ${materia}. ${error.message}`); 
+  }
+}
+
+// Melhorar a função verificarResposta para usar uma abordagem mais flexível e tolerante
+async function verificarResposta(pergunta, respostaUsuario) {
+  if (!progressoUsuario) {
+    console.error("❌ Objeto progressoUsuario não inicializado");
+    return "Desculpe, ocorreu um erro ao verificar sua resposta. Por favor, reinicie o estudo.";
+  }
+
+  const respostaCorreta = pergunta.respostaCorreta;
+  progressoUsuario.totalPerguntas++;
+  
+  // Verifica se está vazio ou muito curto
+  if (!respostaUsuario || respostaUsuario.trim().length < 2) {
+    return "Resposta muito curta. Por favor, forneça uma resposta mais completa.";
+  }
+  
+  try {
+    console.log("🤖 Verificando resposta com OpenRouter...")
+    console.log("📝 Pergunta:", pergunta.pergunta);
+    console.log("📝 Resposta do usuário:", respostaUsuario);
+    console.log("📝 Resposta correta:", respostaCorreta);
+    
+    // Cria um prompt para a API
+    const prompt = `Você é um assistente educacional preciso que avalia respostas.
+    
+Pergunta: "${pergunta.pergunta}"
+Resposta correta: "${respostaCorreta}"
+Resposta do estudante: "${respostaUsuario}"
+
+A resposta do estudante está correta considerando o significado e conceito? Avalie se a resposta demonstra compreensão do conceito, não apenas correspondência textual exata.
+
+Dê o resultado como "CORRETO" ou "INCORRETO", seguido de uma breve explicação de um ou dois pontos sobre por que a resposta está correta ou incorreta.
+
+Formato de saída:
+RESULTADO: [CORRETO/INCORRETO]
+EXPLICAÇÃO: [breve explicação]`;
+
+    // Chama a API para verificar a resposta
+    const resultadoAPI = await chamarOpenRouter(prompt, false);
+    console.log("🤖 Resposta da API:", resultadoAPI);
+    
+    // Extrai o resultado (CORRETO ou INCORRETO)
+    const resultado = resultadoAPI.match(/RESULTADO:\s*(CORRETO|INCORRETO)/i);
+    const explicacao = resultadoAPI.match(/EXPLICAÇÃO:\s*(.+?)(?:\n|$)/is);
+    
+    const estaCorreto = resultado && resultado[1].toUpperCase() === "CORRETO";
+    const textoExplicacao = explicacao ? explicacao[1].trim() : "";
+    
+    // Atualiza o progresso se estiver correto
+    if (estaCorreto) {
+      progressoUsuario.respostasCorretas++;
+      return `Correto! ✅ ${textoExplicacao}`;
+    } else {
+      return `Incorreto. ❌ ${textoExplicacao}\nA resposta correta seria: ${respostaCorreta}`;
+    }
+  } catch (error) {
+    console.error("❌ Erro ao verificar resposta com API:", error);
+    
+    // Fallback para o método baseado em similaridade
+    console.log("⚠️ Usando método de similaridade como fallback");
+    
+    // Normalizando as respostas
+    const userNormalizado = respostaUsuario.toLowerCase()
+      .replace(/[.,;:!?'"()\-]/g, '') // Remove pontuação
+      .replace(/\s+/g, ' ')           // Normaliza espaços
+      .trim();
+    
+    const correctNormalizado = respostaCorreta.toLowerCase()
+      .replace(/[.,;:!?'"()\-]/g, '') // Remove pontuação
+      .replace(/\s+/g, ' ')           // Normaliza espaços
+      .trim();
+    
+    // Verificação exata após normalização
+    if (userNormalizado === correctNormalizado) {
+      progressoUsuario.respostasCorretas++;
+      return "Correto! ✅ (verificado por similaridade)";
+    }
+    
+    // Verificação por contenção de palavras-chave
+    const palavrasChave = correctNormalizado.split(' ').filter(p => p.length > 3);
+    const palavrasEncontradas = palavrasChave.filter(palavra => userNormalizado.includes(palavra));
+    
+    // MAIS TOLERANTE: Reduzimos o requisito para 55% das palavras-chave
+    if (palavrasChave.length === 0 || palavrasEncontradas.length >= Math.ceil(palavrasChave.length * 0.55)) {
+      progressoUsuario.respostasCorretas++;
+      return "Correto! ✅ Sua resposta contém os elementos essenciais. (verificado por similaridade)";
+    }
+    
+    // Verificação por similaridade
+    const similaridade = calcularSimilaridade(userNormalizado, correctNormalizado);
+    console.log(`📊 Similaridade entre respostas: ${(similaridade * 100).toFixed(1)}%`);
+    
+    // Reduzimos o limite para 45%
+    if (similaridade > 0.45) {
+      progressoUsuario.respostasCorretas++;
+      return "Correto! ✅ Sua resposta é similar à esperada. (verificado por similaridade)";
+    }
+    
+    return "Incorreto. ❌ A resposta correta seria: " + respostaCorreta;
+  }
+}
+
+// Função auxiliar para extrair palavras fundamentais
+function extrairPalavrasFundamentais(texto) {
+  // Divide o texto em palavras
+  const palavras = texto.split(' ');
+  
+  // Identifica palavras longas (substantivos, verbos importantes)
+  // e filtra palavras comuns pouco significativas
+  const palavrasComuns = ['com', 'que', 'para', 'por', 'dos', 'das', 'uma', 'nas', 'aos', 'seu', 'sua'];
+  
+  return palavras
+    .filter(palavra => palavra.length > 5) // Palavras mais longas são geralmente mais importantes
+    .filter(palavra => !palavrasComuns.includes(palavra)); // Remove palavras comuns
+}
+
+// Função para calcular a similaridade entre duas strings
+function calcularSimilaridade(str1, str2) {
+  const [shorter, longer] = [str1, str2].sort((a, b) => a.length - b.length);
+  const longerLength = longer.length;
+  if (longerLength === 0) return 1.0;
+  return (longerLength - calcularDistanciaLevenshtein(longer, shorter)) / parseFloat(longerLength);
+}
+
+// Função para calcular a distância de Levenshtein
+function calcularDistanciaLevenshtein(a, b) {
+  const an = a ? a.length : 0;
+  const bn = b ? b.length : 0;
+  if (an === 0) return bn;
+  if (bn === 0) return an;
+  const matrix = Array.from({ length: an + 1 }, () => Array(bn + 1).fill(0));
+  for (let i = 0; i <= an; i++) matrix[i][0] = i;
+  for (let j = 0; j <= bn; j++) matrix[0][j] = j;
+  for (let i = 1; i <= an; i++) {
+    for (let j = 1; j <= bn; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return matrix[an][bn];
+}
+
+function verificarProgresso() {
+  const { respostasCorretas, totalPerguntas, totalPerguntasDoNivel } = progressoUsuario;
+  
+  // Verifica se totalPerguntas é zero para evitar NaN
+  const percentualAcertos = totalPerguntas > 0 ? (respostasCorretas / totalPerguntas) * 100 : 0;
+  
+  console.log(`📊 Progresso: ${respostasCorretas}/${totalPerguntas} (${percentualAcertos.toFixed(1)}%)`);
+
+  // Se ainda não respondeu todas as perguntas do nível, continue no mesmo nível
+  if (totalPerguntas < totalPerguntasDoNivel) {
+    return `Progresso atual: ${respostasCorretas}/${totalPerguntas} (${percentualAcertos.toFixed(1)}%) - Responda todas as ${totalPerguntasDoNivel} perguntas para avançar.`;
+  }
+  
+  // Só avança de nível após responder todas as perguntas e atingir o percentual mínimo
+  if (percentualAcertos >= 70 || respostasCorretas >= Math.ceil(totalPerguntasDoNivel * 0.7)) {
+    let novoNivel = progressoUsuario.nivelAtual;
+    
+    if (progressoUsuario.nivelAtual === 'iniciante') {
+      novoNivel = 'intermediario';
+    } else if (progressoUsuario.nivelAtual === 'intermediario') {
+      novoNivel = 'avancado';
+    } else {
+      return "Parabéns! Você completou todos os níveis.";
+    }
+    
+    // Atualizar nível e resetar contadores
+    progressoUsuario.nivelAtual = novoNivel;
+    
+    // Ajustar o total de perguntas do novo nível
+    const perguntasNovoNivel = niveis[novoNivel];
+    progressoUsuario.totalPerguntasDoNivel = perguntasNovoNivel ? perguntasNovoNivel.length : 5;
+    
+    progressoUsuario.respostasCorretas = 0;
+    progressoUsuario.totalPerguntas = 0;
+    
+    return `Você atingiu ${percentualAcertos.toFixed(1)}% de acertos! Avançou para o nível ${novoNivel}.`;
+  }
+  
+  // Se não atingiu o percentual mínimo, precisa tentar novamente
+  progressoUsuario.respostasCorretas = 0;
+  progressoUsuario.totalPerguntas = 0;
+  return `Você atingiu ${percentualAcertos.toFixed(1)}% de acertos. Precisa de pelo menos 70% para avançar. Tente novamente!`;
+}
+
+async function gerarExplicacao(materia, nivel = 'iniciante') {
+  console.log(`🤖 Gerando explicação dinâmica para: ${materia} (Nível: ${nivel})`);
+  
+  let profundidade;
+  switch(nivel) {
+    case 'intermediario':
+      profundidade = "Forneça uma explicação de nível intermediário, aprofundando nos conceitos. Inclua exemplos práticos e algumas aplicações.";
+      break;
+    case 'avancado':
+      profundidade = "Forneça uma explicação avançada e detalhada, abordando aspectos complexos e nuances do tema. Inclua discussões sobre teoria, aplicações avançadas e tendências atuais.";
+      break;
+    case 'iniciante':
+    default:
+      profundidade = "Forneça uma explicação básica e introdutória, focando nos conceitos fundamentais e definições essenciais.";
+  }
+  
+  const prompt = `Explique o tópico "${materia}" para um estudante de nível ${nivel}. ${profundidade} 
+  A explicação deve ser abrangente o suficiente para que o estudante possa responder a perguntas sobre o tema.
+  Estruture a explicação em tópicos claros e inclua exemplos onde apropriado.`;
+  
+  try {
+    // Tentar obter a explicação da API
+    const explicacaoTexto = await chamarOpenRouter(prompt, false);
+    
+    // Verificação de sanidade
+    if (!explicacaoTexto || explicacaoTexto.length < 50) { 
+      console.log("⚠️ Explicação gerada muito curta ou inválida, usando fallback.");
+      return gerarExplicacaoFallback(materia, nivel);
+    }
+    
+    return explicacaoTexto;
+  } catch (error) {
+    console.error(`❌ Falha ao gerar explicação dinâmica para ${materia} (Nível: ${nivel}):`, error);
+    // Usar explicação de fallback em caso de erro na API
+    console.log("🔄 Usando explicação de fallback devido a erro na API.");
+    return gerarExplicacaoFallback(materia, nivel);
+  }
+}
+
+async function gerarPerguntas(materia, explicacao, nivel = 'iniciante') {
+  console.log(`🤖 Gerando perguntas dinâmicas para: ${materia} (Nível: ${nivel})`);
+  
+  // Resumo da explicação para incluir no prompt (limitado para não exceder o contexto)
+  const explicacaoResumida = explicacao.length > 500 ? explicacao.substring(0, 500) + "..." : explicacao;
+  
+  const prompt = `Com base na seguinte explicação sobre "${materia}":
+  
+  ${explicacaoResumida}
+  
+  Gere 5 perguntas de múltipla escolha para o nível "${nivel}". As perguntas devem ser diretamente baseadas no conteúdo da explicação acima.
+  
+  Para cada pergunta, forneça a pergunta em si ('pergunta') e a resposta correta ('respostaCorreta').
+  
+  Retorne APENAS um objeto JSON com a seguinte estrutura:
+  {
+    "perguntas": [
+      { "pergunta": "...", "respostaCorreta": "..." },
+      // ...mais perguntas
+    ]
+  }`;
+
+  try {
+    let respostaTexto = await chamarOpenRouter(prompt, true); // Espera JSON
+
+    // Limpa possíveis marcadores Markdown antes do parse
+    console.log("📝 Limpando resposta da API antes do parse...");
+    respostaTexto = respostaTexto.trim();
+    if (respostaTexto.startsWith("```json")) {
+        respostaTexto = respostaTexto.substring(7, respostaTexto.length - 3).trim();
+    } else if (respostaTexto.startsWith("```")) {
+        respostaTexto = respostaTexto.substring(3, respostaTexto.length - 3).trim();
+    }
+    console.log("📝 Resposta limpa:", respostaTexto);
+
+    const perguntasObj = JSON.parse(respostaTexto);
+
+    // Validação da estrutura recebida
+    if (!perguntasObj || 
+        !Array.isArray(perguntasObj.perguntas) || 
+        perguntasObj.perguntas.length < 3 ||
+        !perguntasObj.perguntas[0].pergunta || 
+        !perguntasObj.perguntas[0].respostaCorreta) {
+      console.error("❌ Estrutura JSON de perguntas inválida recebida da API:", perguntasObj);
+      throw new Error("A API retornou perguntas em formato inválido.");
+    }
+    
+    console.log("✅ Perguntas JSON recebidas e validadas para nível:", nivel);
+    return perguntasObj.perguntas;
+
+  } catch (error) {
+    console.error(`❌ Falha ao gerar/parsear perguntas dinâmicas para ${materia} (Nível: ${nivel}):`, error);
+    throw new Error(`Não foi possível gerar perguntas para ${materia} via API.`);
+  }
+}
+
+// Função para gerar explicação de fallback específicas para cada matéria
+function gerarExplicacaoFallback(materia, nivel = 'iniciante') {
+  console.log(`⚠️ Usando explicação fallback para ${materia} (nível ${nivel})`);
+  
+  // Explicações específicas para matérias conhecidas
+  const explicacoesPadrao = {
+    'cdb e cdi': {
+      iniciante: `# CDB e CDI - Conceitos Básicos
+
+O CDB (Certificado de Depósito Bancário) é um título de renda fixa emitido por bancos. Quando você investe em um CDB, está emprestando dinheiro ao banco em troca de uma remuneração futura.
+
+O CDI (Certificado de Depósito Interbancário) representa a taxa média das operações de empréstimos entre bancos. É a principal referência para investimentos de renda fixa no Brasil.
+
+Características principais do CDB:
+- Garantia do FGC (Fundo Garantidor de Créditos) de até R$ 250 mil por CPF e instituição financeira
+- Tributação regressiva de IR (de 22,5% a 15%, dependendo do prazo)
+- Rentabilidade geralmente expressa como % do CDI
+
+Os CDBs podem ser:
+- Prefixados: taxa definida no momento da aplicação
+- Pós-fixados: atrelados a um indexador como CDI ou IPCA
+- Híbridos: combinam características dos dois tipos anteriores
+
+Para investidores iniciantes, CDBs são considerados seguros e oferecem rendimento superior à poupança.`,
+
+      intermediario: `# CDB e CDI - Análise Intermediária
+
+## Certificado de Depósito Bancário (CDB)
+O CDB é um instrumento de captação de recursos utilizado pelos bancos comerciais. Ao comprar um CDB, o investidor se torna credor da instituição financeira.
+
+### Tipos de CDB:
+1. **Prefixados**: Rentabilidade definida no momento da aplicação, independente das variações futuras das taxas de juros.
+2. **Pós-fixados**: Rentabilidade varia conforme um indexador (normalmente CDI).
+3. **Híbridos**: Combinam características prefixadas e pós-fixadas, como CDBs "IPCA + taxa prefixada".
+
+### Tributação:
+- IR regressivo de 22,5% a 15%, conforme prazo do investimento:
+  - Até 180 dias: 22,5%
+  - De 181 a 360 dias: 20%
+  - De 361 a 720 dias: 17,5%
+  - Acima de 720 dias: 15%
+- IOF regressivo para resgates antes de 30 dias
+
+## Certificado de Depósito Interbancário (CDI)
+O CDI é um título de emissão das instituições financeiras para equilibrar liquidez entre bancos. Sua taxa serve como benchmark para o mercado de renda fixa.
+
+A taxa CDI acompanha de perto a taxa Selic, normalmente ficando um pouco abaixo. As diferenças ocorrem devido à dinâmica entre os bancos e às expectativas de mercado.
+
+### Características da liquidez:
+- Alguns CDBs permitem resgate antecipado (liquidez diária)
+- Outros só podem ser resgatados no vencimento
+- No resgate antecipado, aplica-se marcação a mercado, que pode resultar em rendimento menor que o esperado
+
+Os CDBs são uma ferramenta importante para diversificação em renda fixa e podem compor a parcela conservadora de uma carteira de investimentos.`,
+
+      avancado: `# CDB e CDI - Análise Avançada
+
+## Precificação e Estruturação dos CDBs
+A precificação de CDBs é influenciada por diversos fatores macroeconômicos e específicos da instituição emissora:
+
+### Fatores Estruturais:
+1. **Basileia III**: O Acordo de Basileia III estabelece regras mais rígidas de capital e liquidez, influenciando diretamente o apetite dos bancos pela captação via CDB.
+2. **Rating da Instituição**: Bancos com classificação de risco inferior frequentemente oferecem CDBs com taxas mais elevadas para compensar o risco percebido.
+3. **Estratégia de Funding**: O mix de captação dos bancos (depósitos à vista, poupança, CDBs, LCAs, etc.) impacta a precificação de cada instrumento.
+
+### Marcação a Mercado (MtM):
+A MtM é fundamental para entender o valor de mercado de um CDB prefixado em caso de resgate antecipado. A relação entre taxas de juros e preço é inversamente proporcional:
+
+- Se as taxas de mercado sobem após a compra do CDB:
+  - O valor presente do título cai
+  - Em caso de resgate antecipado, o investidor pode ter rendimento inferior ao esperado
+
+- Se as taxas de mercado caem após a compra do CDB:
+  - O valor presente do título sobe
+  - Em caso de resgate antecipado, o investidor pode ter ganho adicional
+
+### Curva de Juros e Estrutura a Termo:
+A curva de juros futuros do CDI é essencial para a precificação de CDBs de longo prazo. A formatação da curva (normal, invertida ou flat) sinaliza as expectativas do mercado:
+
+- **Curva normal** (ascendente): Expectativa de alta das taxas de juros
+- **Curva invertida** (descendente): Expectativa de queda das taxas de juros
+- **Curva flat** (plana): Estabilidade esperada nas taxas
+
+### Estratégias Avançadas:
+- **Ladder (Escada) de CDBs**: Alocação em vários CDBs com vencimentos escalonados para reduzir risco de reinvestimento e aumentar liquidez
+- **Barbell**: Concentração em CDBs de curto e longo prazo, evitando prazos intermediários
+- **Bullet**: Concentração em um prazo específico alinhado com o horizonte de investimento
+
+### Comparação com Outros Instrumentos:
+- **Operações Compromissadas**: Oferecem liquidez imediata com lastro em títulos públicos, mas geralmente com rentabilidade inferior aos CDBs
+- **Debêntures**: Podem oferecer taxas superiores, mas com risco de crédito privado
+- **LCAs/LCIs**: Isentas de IR, mas com restrições de liquidez e, geralmente, taxas inferiores aos CDBs equivalentes
+
+O entendimento das nuances técnicas dos CDBs e CDI permite ao investidor sofisticado otimizar alocações, realizar operações estruturadas e aproveitar ineficiências pontuais de mercado.`
+    }
+  };
+  
+  // Normalizar a matéria para busca case-insensitive
+  const materiaLower = materia.toLowerCase();
+  
+  // Se for uma matéria conhecida, retorna a explicação específica
+  for (const [chave, explicacoes] of Object.entries(explicacoesPadrao)) {
+    if (materiaLower.includes(chave) || chave.includes(materiaLower)) {
+      return explicacoes[nivel] || explicacoes['iniciante']; // Fallback para nível iniciante se o nível solicitado não existir
+    }
+  }
+  
+  // Explicação genérica para matérias desconhecidas
+  switch(nivel) {
+    case 'intermediario':
+      return `# ${materia} - Nível Intermediário
+
+Esta é uma explicação de fallback para ${materia} em nível intermediário.
+
+Infelizmente, não foi possível gerar uma explicação personalizada para este tema. Recomendamos tentar novamente mais tarde ou escolher um tema mais específico.
+
+Enquanto isso, você pode consultar fontes confiáveis sobre ${materia} para aprofundar seus conhecimentos.`;
+      
+    case 'avancado':
+      return `# ${materia} - Nível Avançado
+
+Esta é uma explicação de fallback para ${materia} em nível avançado.
+
+Não foi possível gerar uma explicação personalizada detalhada para este tema. Recomendamos consultar literatura especializada ou tentar novamente mais tarde.
+
+Para estudos avançados em ${materia}, é recomendável buscar artigos científicos e publicações acadêmicas recentes.`;
+      
+    case 'iniciante':
+    default:
+      return `# ${materia} - Conceitos Básicos
+
+Esta é uma explicação básica de fallback para ${materia}.
+
+Infelizmente, não foi possível gerar uma explicação personalizada para este tema no momento. Recomendamos tentar novamente mais tarde.
+
+Para começar seus estudos em ${materia}, recomendamos buscar definições básicas e conceitos introdutórios em livros didáticos ou sites educacionais confiáveis.`;
+  }
+}
+
+// Função para gerar perguntas placeholder em caso de falha da API
+async function gerarPerguntasPlaceholder(materia, nivel = 'iniciante') {
+    console.warn(`⚠️ Usando perguntas placeholder para: ${materia} (Nível: ${nivel})`);
+    
+    // Perguntas específicas para CDB e CDI
+    const perguntasEspecificas = {
+      'cdb e cdi': {
+        iniciante: [
+          { 
+            pergunta: "O que significa a sigla CDB?", 
+            respostaCorreta: "Certificado de Depósito Bancário" 
+          },
+          { 
+            pergunta: "Qual é a principal função do CDB?", 
+            respostaCorreta: "Captar recursos para os bancos, funcionando como um empréstimo do investidor para a instituição financeira" 
+          },
+          { 
+            pergunta: "O que o CDI representa no contexto de investimentos?", 
+            respostaCorreta: "É uma taxa de referência para investimentos de renda fixa, baseada nas operações entre bancos" 
+          },
+          { 
+            pergunta: "Se um CDB rende 110% do CDI e o CDI acumula 10% em um ano, quanto receberá um investidor que aplicou R$ 1.000?", 
+            respostaCorreta: "R$ 1.110" 
+          },
+          { 
+            pergunta: "Até que valor o CDB é garantido pelo FGC (Fundo Garantidor de Créditos)?", 
+            respostaCorreta: "Até R$ 250 mil por CPF e instituição financeira" 
+          }
+        ],
+        
+        intermediario: [
+          { 
+            pergunta: "Quais são os três tipos principais de CDBs quanto à forma de remuneração?", 
+            respostaCorreta: "Prefixados, pós-fixados e híbridos" 
+          },
+          { 
+            pergunta: "Como funciona a tributação de Imposto de Renda sobre o CDB para um investimento de 2 anos?", 
+            respostaCorreta: "Alíquota de 15% sobre o rendimento, conforme a tabela regressiva" 
+          },
+          { 
+            pergunta: "Qual é a relação entre a Taxa Selic e o CDI?", 
+            respostaCorreta: "O CDI normalmente acompanha de perto a Taxa Selic, sendo um pouco menor" 
+          },
+          { 
+            pergunta: "O que acontece com o rendimento de um CDB prefixado se a taxa Selic subir durante o período de investimento?", 
+            respostaCorreta: "O rendimento nominal permanece o mesmo, mas o rendimento real pode ficar menos atrativo comparado a novos investimentos" 
+          },
+          { 
+            pergunta: "Além do Imposto de Renda, que outro imposto pode incidir sobre resgates de CDB?", 
+            respostaCorreta: "IOF (Imposto sobre Operações Financeiras) para resgates antes de 30 dias" 
+          }
+        ],
+        
+        avancado: [
+          { 
+            pergunta: "Como a curva de juros do CDI influencia a precificação de CDBs de longo prazo?", 
+            respostaCorreta: "A curva de juros do CDI representa as taxas futuras esperadas, permitindo que os bancos precifiquem CDBs de longo prazo de acordo com as expectativas do mercado para as taxas de juros" 
+          },
+          { 
+            pergunta: "O que é a estratégia 'ladder' (escada) de CDBs e quais seus benefícios?", 
+            respostaCorreta: "É a distribuição de recursos em CDBs com diferentes vencimentos, permitindo reinvestimentos periódicos a novas taxas e melhor gerenciamento de liquidez" 
+          },
+          { 
+            pergunta: "Como as regras de Basileia III afetam a oferta e precificação de CDBs pelos bancos?", 
+            respostaCorreta: "As regras de Basileia III exigem índices de capital mais elevados, o que pode levar alguns bancos a oferecer CDBs com taxas mais atrativas para captar recursos e melhorar seus indicadores de liquidez" 
+          },
+          { 
+            pergunta: "Explique como funciona a marcação a mercado (MtM) em CDBs prefixados e seu impacto para o investidor em caso de resgate antecipado.", 
+            respostaCorreta: "Na marcação a mercado, CDBs prefixados são reavaliados diariamente conforme as taxas de mercado. Se as taxas subirem após a compra, o valor de mercado cai, gerando prejuízo em resgates antecipados. Se as taxas caírem, o valor de mercado sobe, gerando ganho adicional" 
+          },
+          { 
+            pergunta: "Qual a diferença entre uma operação compromissada e um CDB do ponto de vista da captação bancária?", 
+            respostaCorreta: "Nas operações compromissadas, o banco vende títulos com compromisso de recompra, oferecendo lastro; no CDB, o banco emite um título de dívida sem lastro específico. As compromissadas têm prazos geralmente mais curtos e tratamento contábil diferente nas instituições financeiras" 
+          }
+        ]
+      }
+    };
+    
+    // Normalizar a matéria para busca case-insensitive
+    const materiaLower = materia.toLowerCase();
+    
+    // Verificar se temos perguntas específicas para esta matéria
+    for (const [chave, perguntas] of Object.entries(perguntasEspecificas)) {
+      if (materiaLower.includes(chave) || chave.includes(materiaLower)) {
+        return perguntas[nivel] || perguntas['iniciante']; // Fallback para nível iniciante se o nível solicitado não existir
+      }
+    }
+    
+    // Se não encontrou perguntas específicas, usa perguntas genéricas
+    let perguntas;
+    switch(nivel) {
+      case 'intermediario':
+        perguntas = [
+          { pergunta: `Explique os princípios fundamentais de ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder interm. 1" },
+          { pergunta: `Como ${materia} se relaciona com outras áreas? (Placeholder)`, respostaCorreta: "Resposta placeholder interm. 2" },
+          { pergunta: `Quais são as principais teorias em ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder interm. 3" },
+          { pergunta: `Desafios encontrados no estudo de ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder interm. 4" },
+          { pergunta: `Métodos utilizados para pesquisa em ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder interm. 5" }
+        ];
+        break;
+      case 'avancado':
+        perguntas = [
+          { pergunta: `Problemas complexos em ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 1" },
+          { pergunta: `Estado atual da pesquisa em ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 2" },
+          { pergunta: `Tendências futuras em ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 3" },
+          { pergunta: `Casos avançados de aplicação de ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 4" },
+          { pergunta: `Integração de ${materia} com tecnologias emergentes? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 5" }
+        ];
+        break;
+      case 'iniciante':
+      default:
+        perguntas = [
+          { pergunta: `O que é ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder iniciante 1" },
+          { pergunta: `Quando surgiu ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder iniciante 2" },
+          { pergunta: `Quais são os principais conceitos de ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder iniciante 3" },
+          { pergunta: `Como ${materia} é aplicado no dia a dia? (Placeholder)`, respostaCorreta: "Resposta placeholder iniciante 4" },
+          { pergunta: `Quais são os benefícios de estudar ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder iniciante 5" }
+        ];
+    }
+    
+    return perguntas;
+}
+
+async function enviarProximaPergunta(jid, isGroup) {
+  const estado = estadoConversa[jid];
+  if (!estado) {
+    console.error('Estado da conversa não encontrado para:', jid);
+    return;
+  }
+
+  const perguntas = niveis[estado.nivelAtual];
+  if (!perguntas || perguntas.length === 0) {
+    console.error('Perguntas não encontradas para o nível:', estado.nivelAtual);
+    await enviarMensagemComDelay(jid, { text: 'Houve um problema ao recuperar as perguntas. Por favor, inicie um novo estudo.' }, isGroup);
+    delete estadoConversa[jid]; // Limpa o estado para evitar problemas
+    return;
+  }
+
+  if (estado.indicePergunta >= perguntas.length) {
+    console.error('Índice de pergunta fora dos limites:', estado.indicePergunta, 'de', perguntas.length);
+    await enviarMensagemComDelay(jid, { text: 'Houve um problema ao recuperar a próxima pergunta. Por favor, inicie um novo estudo.' }, isGroup);
+    delete estadoConversa[jid]; // Limpa o estado para evitar problemas
+    return;
+  }
+
+  const perguntaAtual = perguntas[estado.indicePergunta];
+  if (!perguntaAtual) {
+    console.error('Pergunta atual não encontrada para:', jid);
+    return;
+  }
+
+  await enviarMensagemComDelay(jid, { text: `❓ Pergunta: ${perguntaAtual.pergunta}` }, isGroup);
+}
+
+// Modificar para evitar múltiplas transições de nível ou mensagens duplicadas
+async function processarResposta(jid, texto, isGroup) {
+  // Evita processamento concorrente de respostas
+  if (processandoRespostaFlag) {
+    console.log("⚠️ Já existe um processamento de resposta em andamento. Ignorando.");
+    return;
+  }
+  
+  processandoRespostaFlag = true;
+  
+  try {
+    const estado = estadoConversa[jid];
+    if (!estado) {
+      console.error('Estado da conversa não encontrado para:', jid);
+      processandoRespostaFlag = false;
+      return;
+    }
+    
+    const perguntas = niveis[estado.nivelAtual];
+    if (!perguntas || perguntas.length === 0) {
+      console.error('Perguntas não encontradas para o nível:', estado.nivelAtual);
+      await enviarMensagemComDelay(jid, { text: 'Houve um problema ao recuperar as perguntas. Por favor, inicie um novo estudo.' }, isGroup);
+      delete estadoConversa[jid];
+      processandoRespostaFlag = false;
+      return;
+    }
+
+    if (estado.indicePergunta >= perguntas.length) {
+      console.log(`✅ Todas as perguntas do nível ${estado.nivelAtual} já foram respondidas`);
+      const progresso = verificarProgresso();
+      await enviarMensagemComDelay(jid, { text: progresso }, isGroup);
+      
+      // Verifica se avançou de nível
+      const nivelAnterior = estado.nivelAtual;
+      const nivelAtual = progressoUsuario.nivelAtual;
+      
+      if (nivelAtual !== nivelAnterior) {
+        // Evita múltiplas tentativas de enviar explicações
+        if (envioExplicacaoEmAndamento[jid]) {
+          console.log(`⚠️ Já existe um envio de explicação em andamento para ${jid}. Ignorando.`);
+          processandoRespostaFlag = false;
+          return;
+        }
+        
+        envioExplicacaoEmAndamento[jid] = true;
+        
+        try {
+          await enviarMensagemComDelay(jid, { text: `🎉 Parabéns! Você avançou para o nível ${nivelAtual}. Preparando nova explicação...` }, isGroup);
+          
+          const materia = estado.materia;
+          let explicacao;
+          
+          try {
+            // Tenta obter explicação via API apenas uma vez
+            explicacao = await gerarExplicacao(materia, nivelAtual);
+          } catch (error) {
+            console.error(`❌ Erro ao gerar explicação para novo nível:`, error);
+            explicacao = gerarExplicacaoFallback(materia, nivelAtual);
+          }
+          
+          await enviarMensagemComDelay(jid, { text: `📖 ### **${materia} – ${nivelAtual.toUpperCase()}**\n\n${explicacao}` }, isGroup);
+          
+          // Atualiza o estado para o novo nível
+          estado.nivelAtual = nivelAtual;
+          estado.indicePergunta = 0;
+          
+          // Prepara perguntas para o novo nível, se necessário
+          if (!niveis[nivelAtual] || niveis[nivelAtual].length === 0) {
+            try {
+              niveis[nivelAtual] = await gerarPerguntasPlaceholder(materia, nivelAtual);
+            } catch (error) {
+              console.error(`❌ Erro ao gerar perguntas para novo nível:`, error);
+              // Use perguntas placeholders como fallback
+              niveis[nivelAtual] = await gerarPerguntasPlaceholder(materia, nivelAtual);
+            }
+          }
+          
+          // Envia a primeira pergunta do novo nível após delay
+          await delay(2000);
+          await enviarProximaPergunta(jid, isGroup);
+        } catch (error) {
+          console.error(`❌ Erro ao processar avanço de nível:`, error);
+          await enviarMensagemComDelay(jid, { text: `Houve um problema ao avançar para o nível ${nivelAtual}. Por favor, reinicie o estudo.` }, isGroup);
+          delete estadoConversa[jid];
+        } finally {
+          // Remove o flag de envio em andamento
+          delete envioExplicacaoEmAndamento[jid];
+        }
+      } else {
+        // Se não avançou de nível, reinicia as perguntas
+        estado.indicePergunta = 0;
+        await enviarMensagemComDelay(jid, { text: 'Vamos recomeçar as perguntas deste nível para você melhorar seu desempenho.' }, isGroup);
+        await delay(1000);
+        await enviarProximaPergunta(jid, isGroup);
+      }
+      
+      processandoRespostaFlag = false;
+      return;
+    }
+
+    const perguntaAtual = perguntas[estado.indicePergunta];
+    if (!perguntaAtual) {
+      console.error('Pergunta atual não encontrada para:', jid);
+      processandoRespostaFlag = false;
+      return;
+    }
+
+    console.log('🧠 Verificando resposta para:', perguntaAtual.pergunta);
+    console.log('🧠 Resposta do usuário:', texto);
+    console.log('🧠 Resposta correta:', perguntaAtual.respostaCorreta);
+    
+    // Enviar mensagem de feedback indicando que a resposta está sendo processada
+    await enviarMensagemComDelay(jid, { text: "⏳ Analisando sua resposta..." }, isGroup);
+    
+    // Agora verificarResposta é uma função assíncrona
+    const resposta = await verificarResposta(perguntaAtual, texto);
+    await enviarMensagemComDelay(jid, { text: resposta }, isGroup);
+
+    // Avança para a próxima pergunta independentemente se acertou ou não
+    estado.indicePergunta++;
+    
+    // Se ainda tem mais perguntas no nível atual, envia a próxima
+    if (estado.indicePergunta < perguntas.length) {
+      await enviarProximaPergunta(jid, isGroup);
+    } else {
+      // Se já respondeu todas, finaliza o nível e verifica se pode avançar
+      console.log(`✅ Todas as perguntas do nível ${estado.nivelAtual} foram respondidas`);
+      const progresso = verificarProgresso();
+      await enviarMensagemComDelay(jid, { text: progresso }, isGroup);
+      
+      // Verifica se avançou de nível
+      const nivelAnterior = estado.nivelAtual;
+      const nivelAtual = progressoUsuario.nivelAtual;
+      
+      if (nivelAtual !== nivelAnterior) {
+        // Evita múltiplas tentativas de enviar explicações
+        if (envioExplicacaoEmAndamento[jid]) {
+          console.log(`⚠️ Já existe um envio de explicação em andamento para ${jid}. Ignorando.`);
+          processandoRespostaFlag = false;
+          return;
+        }
+        
+        envioExplicacaoEmAndamento[jid] = true;
+        
+        try {
+          await enviarMensagemComDelay(jid, { text: `🎉 Parabéns! Você avançou para o nível ${nivelAtual}. Preparando nova explicação...` }, isGroup);
+          
+          const materia = estado.materia;
+          let explicacao;
+          
+          try {
+            // Tenta obter explicação via API apenas uma vez
+            explicacao = await gerarExplicacao(materia, nivelAtual);
+          } catch (error) {
+            console.error(`❌ Erro ao gerar explicação para novo nível:`, error);
+            explicacao = gerarExplicacaoFallback(materia, nivelAtual);
+          }
+          
+          await enviarMensagemComDelay(jid, { text: `📖 ### **${materia} – ${nivelAtual.toUpperCase()}**\n\n${explicacao}` }, isGroup);
+          
+          // Atualiza o estado para o novo nível
+          estado.nivelAtual = nivelAtual;
+          estado.indicePergunta = 0;
+          
+          // Prepara perguntas para o novo nível, se necessário
+          if (!niveis[nivelAtual] || niveis[nivelAtual].length === 0) {
+            try {
+              niveis[nivelAtual] = await gerarPerguntasPlaceholder(materia, nivelAtual);
+            } catch (error) {
+              console.error(`❌ Erro ao gerar perguntas para novo nível:`, error);
+              // Use perguntas placeholders como fallback
+              niveis[nivelAtual] = await gerarPerguntasPlaceholder(materia, nivelAtual);
+            }
+          }
+          
+          // Envia a primeira pergunta do novo nível após delay
+          await delay(2000);
+          await enviarProximaPergunta(jid, isGroup);
+        } catch (error) {
+          console.error(`❌ Erro ao processar avanço de nível:`, error);
+          await enviarMensagemComDelay(jid, { text: `Houve um problema ao avançar para o nível ${nivelAtual}. Por favor, reinicie o estudo.` }, isGroup);
+          delete estadoConversa[jid];
+        } finally {
+          // Remove o flag de envio em andamento
+          delete envioExplicacaoEmAndamento[jid];
+        }
+      } else {
+        // Se não avançou de nível, reinicia as perguntas
+        estado.indicePergunta = 0;
+        await enviarMensagemComDelay(jid, { text: 'Vamos recomeçar as perguntas deste nível para você melhorar seu desempenho.' }, isGroup);
+        await delay(1000);
+        await enviarProximaPergunta(jid, isGroup);
+      }
+    }
+  } catch (error) {
+    console.error('❌ Erro ao processar resposta:', error);
+  } finally {
+    processandoRespostaFlag = false;
+  }
+}
+
+// Inicia o servidor
+iniciarConexaoWhatsApp().then(() => {
+  app.listen(3000, () => console.log("Servidor rodando na porta 3000!"));
+});
