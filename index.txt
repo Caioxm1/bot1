@@ -14,7 +14,7 @@ const NIVEL_APRENDIZADO = {
 
 app.use(express.json());
 
-const OPENROUTER_API_KEY = "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";
+const OPENROUTER_API_KEY = "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";
 const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzfdPVe8l1OnXHw6i6kkk3NV9gTt2-oC0sE2WLDuN6InBU1K5kopMyT07kElsCulrNY/exec';
 const GRUPOS_PERMITIDOS = [
   '120363420675161205@g.us' // Grupo original
@@ -143,15 +143,26 @@ function logErroDetalhado(erro) {
   console.error("Stack:", erro.stack);
 }
 
-// Função auxiliar para chamar a API OpenRouter com retries e tratamento de erro
+// Adicionar logs detalhados para erros de autenticação
 async function chamarOpenRouter(prompt, isJsonOutput = false) {
   console.log(`🤖 Chamando OpenRouter. JSON esperado: ${isJsonOutput}`);
   let tentativas = 0;
-  const maxTentativas = 3; // Reduzido para 3 tentativas
+  const maxTentativas = 3;
+  
+  // Tempo de espera entre tentativas (aumenta exponencialmente)
+  const temposDeEspera = [2000, 4000, 8000];
 
   while (tentativas < maxTentativas) {
     try {
       console.time("Tempo de resposta OpenRouter");
+      console.log(`📡 Enviando requisição para OpenRouter (tentativa ${tentativas+1}/${maxTentativas})...`);
+      
+      // Verificar se a API key está definida corretamente
+      if (!OPENROUTER_API_KEY || OPENROUTER_API_KEY.trim() === '') {
+        console.error("🔑 API key da OpenRouter não configurada ou inválida.");
+        throw new Error("API key da OpenRouter não configurada.");
+      }
+      
       const requestBody = {
         model: 'deepseek/deepseek-chat-v3-0324:free',
         messages: [{ role: 'user', content: prompt }],
@@ -160,17 +171,21 @@ async function chamarOpenRouter(prompt, isJsonOutput = false) {
         requestBody.response_format = { type: "json_object" };
       }
 
+      // Configurar cabeçalhos de autenticação corretamente
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'http://localhost',
+        'X-Title': 'Bot de Estudos'
+      };
+
+      // Usar os cabeçalhos configurados na requisição
       const resposta = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
         requestBody,
         {
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-            'HTTP-Referer': 'http://localhost',
-            'X-Title': 'Bot de Estudos'
-          },
-          timeout: 15000 // Aumentado para 15 segundos para geração de conteúdo
+          headers: headers,
+          timeout: 20000 // Aumentado para 20 segundos
         }
       );
       console.timeEnd("Tempo de resposta OpenRouter");
@@ -180,25 +195,70 @@ async function chamarOpenRouter(prompt, isJsonOutput = false) {
       }
 
       console.log("💬 Resposta bruta da OpenRouter:", resposta.data.choices[0].message.content);
+      
+      // Se estamos esperando JSON, tenta validar que é JSON válido
+      if (isJsonOutput) {
+        try {
+          const jsonResponse = JSON.parse(resposta.data.choices[0].message.content);
+          return jsonResponse;
+        } catch (e) {
+          console.warn("⚠️ Resposta deveria ser JSON, mas não pôde ser analisada:", e);
+          // Retorna um objeto estruturado para indicar erro
+          return { 
+            status: 'error', 
+            message: 'Falha ao processar resposta JSON',
+            fallback: resposta.data.choices[0].message.content
+          };
+        }
+      }
+      
       return resposta.data.choices[0].message.content;
 
     } catch (error) {
       console.timeEnd("Tempo de resposta OpenRouter");
       tentativas++;
-      logErroDetalhado(error); // Usa a função de log detalhado existente
-
-      if (error.response?.status === 429) {
-        console.error("🚫 Limite de requisições excedido na OpenRouter.");
-        throw new Error("Limite de requisições excedido. Tente novamente mais tarde."); // Relança o erro
+      
+      // Log detalhado específico para o erro
+      console.error(`❌ Erro na chamada à OpenRouter (tentativa ${tentativas}/${maxTentativas}):`);
+      
+      // Tratamento específico para erros de autenticação
+      if (error.response?.status === 401) {
+        console.error("🔑 Erro de autenticação (401): Credenciais inválidas ou ausentes.");
+        console.error("Detalhes:", error.response?.data || "Sem detalhes disponíveis");
+        // Não tentamos novamente em caso de erro de autenticação
+        throw new Error("Falha na autenticação com a API OpenRouter. Verifique sua API key.");
       }
       
+      // Tratamento para limites de requisição
+      if (error.response?.status === 429) {
+        console.error("🚫 Limite de requisições excedido na OpenRouter (429).");
+        console.error("Detalhes:", error.response?.data || "Sem detalhes disponíveis");
+        console.log(`⏳ Aguardando ${temposDeEspera[tentativas-1]/1000} segundos antes de tentar novamente...`);
+        await delay(temposDeEspera[tentativas-1]);
+        continue; // Pula para a próxima tentativa sem lançar exceção
+      }
+      
+      // Log para outros erros com resposta HTTP
+      if (error.response) {
+        console.error(`Status: ${error.response.status}`);
+        console.error("Dados do erro:", error.response.data);
+      }
+      
+      // Log para erros de rede ou timeout
+      if (error.code === 'ECONNABORTED') {
+        console.error("⏱️ Timeout na requisição para OpenRouter.");
+      } else if (!error.response) {
+        console.error("🌐 Erro de conexão:", error.message);
+      }
+      
+      // Verificar se atingiu o máximo de tentativas
       if (tentativas >= maxTentativas) {
          console.error(`🚫 Falha ao chamar OpenRouter após ${maxTentativas} tentativas.`);
-         throw new Error("Falha ao gerar conteúdo após múltiplas tentativas."); // Relança o erro
+         throw new Error("Falha ao gerar conteúdo após múltiplas tentativas.");
       }
 
-      console.log(`⏳ Tentando novamente em 2 segundos (Tentativa ${tentativas})...`);
-      await delay(2000);
+      console.log(`⏳ Tentando novamente em ${temposDeEspera[tentativas-1]/1000} segundos (Tentativa ${tentativas})...`);
+      await delay(temposDeEspera[tentativas-1]);
     }
   }
 }
@@ -365,8 +425,8 @@ async function iniciarConexaoWhatsApp() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg?.message || !msg.key?.remoteJid) return;
+      const msg = messages[0];
+      if (!msg?.message || !msg.key?.remoteJid) return;
 
     // Extrair o texto da mensagem para verificação
     const texto = msg.message.conversation?.trim() || msg.message.extendedTextMessage?.text?.trim() || "";
@@ -398,46 +458,46 @@ async function iniciarConexaoWhatsApp() {
 
     // Verificar se o usuário tem um estado de conversa ativo
     const temEstadoAtivo = estadoConversa[msg.key.remoteJid] !== undefined;
-    
-    console.log('\n=== NOVA MENSAGEM RECEBIDA ===');
-    console.log('📱 Remetente:', msg.pushName || 'Desconhecido');
-    console.log('🔑 Chat ID:', msg.key.remoteJid);
+
+      console.log('\n=== NOVA MENSAGEM RECEBIDA ===');
+      console.log('📱 Remetente:', msg.pushName || 'Desconhecido');
+      console.log('🔑 Chat ID:', msg.key.remoteJid);
     console.log('🔑 Participant:', msg.key.participant);
     console.log('🔑 fromMe:', msg.key.fromMe);
     console.log('💬 Texto:', texto);
     console.log('🔑 Estado de conversa ativo:', temEstadoAtivo);
-    
-    // Ignora mensagens de status
-    if (msg.key.remoteJid === 'status@broadcast') {
-      console.log('⚠️ Mensagem de status ignorada');
-      return;
-    }
+      
+      // Ignora mensagens de status
+      if (msg.key.remoteJid === 'status@broadcast') {
+        console.log('⚠️ Mensagem de status ignorada');
+        return;
+      }
 
     // Adiciona logs de depuração para verificar o identificador do usuário
     console.log('🔍 Verificando usuário JID:', msg.key.remoteJid);
     console.log('🔍 Usuários autorizados:', USUARIOS_AUTORIZADOS);
 
-    const isGrupoValido = GRUPOS_PERMITIDOS.includes(msg.key.remoteJid);
+      const isGrupoValido = GRUPOS_PERMITIDOS.includes(msg.key.remoteJid);
     const isUsuarioValido = USUARIOS_AUTORIZADOS.includes(msg.key.remoteJid);
       
     console.log('🔒 Verificações Iniciais:');
-    console.log('- Grupo válido:', isGrupoValido);
-    console.log('- Usuário válido:', isUsuarioValido);
+      console.log('- Grupo válido:', isGrupoValido);
+      console.log('- Usuário válido:', isUsuarioValido);
       
-    if (!isGrupoValido && !isUsuarioValido) {
+      if (!isGrupoValido && !isUsuarioValido) {
       console.log('❌ Chat/Usuário não autorizado:', msg.key.remoteJid);
-      return;
-    }
-    
+        return;
+      }
+
     console.log('✅ Verificações de autorização e bot passadas.');
     
     // Verifica se é uma resposta a uma pergunta anterior (conversa ativa)
     if (temEstadoAtivo && !isUserCommand) {
       console.log('🧠 Resposta a pergunta detectada. Processando resposta...');
       await processarResposta(msg.key.remoteJid, texto, isGrupoValido);
-      return;
-    }
-    
+        return;
+      }
+
     // Resto da lógica de processamento
     const textoLower = texto.toLowerCase();
     console.log('🚦 Texto em minúsculas:', textoLower);
@@ -446,13 +506,13 @@ async function iniciarConexaoWhatsApp() {
       console.log('📚 Comando "ajuda" detectado. Enviando lista...');
       await enviarMensagemComDelay(msg.key.remoteJid, { text: LISTA_DE_COMANDOS }, isGrupoValido);
       console.log('📚 Lista de comandos enviada. Saindo do processamento.');
-      return;
-    }
+        return;
+      }
 
     console.log('🚦 Comando não é "ajuda". Prosseguindo...');
     console.log('🧠 Verificando se é comando de estudo...');
 
-    if (pareceSerComandoEstudo(texto)) {
+      if (pareceSerComandoEstudo(texto)) {
       console.log('📚 Processando comando de estudo:', texto);
       
       // Interpretação do comando (SIMPLIFICADA - pode precisar refinar)
@@ -471,13 +531,13 @@ async function iniciarConexaoWhatsApp() {
       if (!comando || !materia) {
            console.log('⚠️ Não foi possível extrair comando/matéria válidos da mensagem:', texto);
            await enviarMensagemComDelay(msg.key.remoteJid, { text: "⚠️ Não entendi qual comando ou matéria você quer. Ex: 'ensinar física quântica'" }, isGrupoValido);
-        return;
-      }
+          return;
+        }
 
       console.log(`💡 Comando interpretado: ${comando}, Matéria: ${materia}`);
 
-        let response;
-        try {
+          let response;
+          try {
         console.log(`⚡ Executando comando: ${comando}`);
         switch (comando) {
           case 'estudar': // 'ensinar' e 'iniciar' também caem aqui
@@ -486,7 +546,7 @@ async function iniciarConexaoWhatsApp() {
             return;
           case 'criar_plano_ensino':
             response = await criarPlanoEnsino(materia);
-              break;
+                break;
           // ... Adicionar outros cases conforme necessário ...
             default:
             response = "❌ Comando não reconhecido internamente. Use 'ajuda'.";
@@ -857,7 +917,49 @@ async function ensinarMateria(materia, jid, isGroup) {
   }
 }
 
-// Melhorar a função verificarResposta para usar uma abordagem mais flexível e tolerante
+// Função para verificar se a resposta é uma sigla financeira
+function verificarRespostaSigla(respostaUsuario, respostaCorreta) {
+  // Normaliza as respostas (remove espaços, converte para maiúsculas)
+  const userNormalizado = respostaUsuario.toUpperCase().replace(/\s+/g, '');
+  const correctNormalizado = respostaCorreta.toUpperCase().replace(/\s+/g, '');
+  
+  // Lista de siglas financeiras importantes para verificação rigorosa
+  const siglas = [
+    'CDB', 'CDI', 'LCI', 'LCA', 'LF', 'IPCA', 'SELIC', 'IOF', 'IR', 'PGBL', 
+    'VGBL', 'FGTS', 'CVM', 'CETIP', 'FGC', 'B3', 'FII', 'ETF', 'FIA', 'FIM'
+  ];
+  
+  // Verificar quais siglas estão presentes na resposta correta
+  const siglasEsperadas = siglas.filter(sigla => correctNormalizado.includes(sigla));
+  
+  // Se não há siglas esperadas na resposta correta, retorna true (não precisa verificar)
+  if (siglasEsperadas.length === 0) {
+    console.log('ℹ️ Sem siglas financeiras para verificar na resposta.');
+    return true;
+  }
+  
+  console.log(`🔤 Checando ${siglasEsperadas.length} siglas financeiras na resposta...`);
+  
+  // Verifica cada sigla encontrada na resposta correta
+  for (const sigla of siglasEsperadas) {
+    console.log(`🔍 Verificando sigla: ${sigla}`);
+    
+    // Para siglas, exigimos correspondência exata
+    if (!userNormalizado.includes(sigla)) {
+      console.log(`❌ Sigla ${sigla} não encontrada na resposta do usuário.`);
+      return false;
+    }
+    
+    // Se encontrou a sigla no texto do usuário, continua verificando as outras
+    console.log(`✅ Sigla ${sigla} encontrada na resposta do usuário.`);
+  }
+  
+  // Se chegou aqui, todas as siglas esperadas foram encontradas
+  return true;
+}
+
+// Remover a lógica de similaridade
+// ... existing code ...
 async function verificarResposta(pergunta, respostaUsuario) {
   if (!progressoUsuario) {
     console.error("❌ Objeto progressoUsuario não inicializado");
@@ -887,6 +989,8 @@ Resposta do estudante: "${respostaUsuario}"
 
 A resposta do estudante está correta considerando o significado e conceito? Avalie se a resposta demonstra compreensão do conceito, não apenas correspondência textual exata.
 
+IMPORTANTE: Se a pergunta envolve siglas financeiras (como CDB, CDI, IPCA, etc.), a resposta do estudante DEVE incluir a sigla correta para ser considerada correta.
+
 Dê o resultado como "CORRETO" ou "INCORRETO", seguido de uma breve explicação de um ou dois pontos sobre por que a resposta está correta ou incorreta.
 
 Formato de saída:
@@ -913,48 +1017,7 @@ EXPLICAÇÃO: [breve explicação]`;
     }
   } catch (error) {
     console.error("❌ Erro ao verificar resposta com API:", error);
-    
-    // Fallback para o método baseado em similaridade
-    console.log("⚠️ Usando método de similaridade como fallback");
-    
-    // Normalizando as respostas
-    const userNormalizado = respostaUsuario.toLowerCase()
-      .replace(/[.,;:!?'"()\-]/g, '') // Remove pontuação
-      .replace(/\s+/g, ' ')           // Normaliza espaços
-      .trim();
-    
-    const correctNormalizado = respostaCorreta.toLowerCase()
-      .replace(/[.,;:!?'"()\-]/g, '') // Remove pontuação
-      .replace(/\s+/g, ' ')           // Normaliza espaços
-      .trim();
-    
-    // Verificação exata após normalização
-    if (userNormalizado === correctNormalizado) {
-      progressoUsuario.respostasCorretas++;
-      return "Correto! ✅ (verificado por similaridade)";
-    }
-    
-    // Verificação por contenção de palavras-chave
-    const palavrasChave = correctNormalizado.split(' ').filter(p => p.length > 3);
-    const palavrasEncontradas = palavrasChave.filter(palavra => userNormalizado.includes(palavra));
-    
-    // MAIS TOLERANTE: Reduzimos o requisito para 55% das palavras-chave
-    if (palavrasChave.length === 0 || palavrasEncontradas.length >= Math.ceil(palavrasChave.length * 0.55)) {
-      progressoUsuario.respostasCorretas++;
-      return "Correto! ✅ Sua resposta contém os elementos essenciais. (verificado por similaridade)";
-    }
-    
-    // Verificação por similaridade
-    const similaridade = calcularSimilaridade(userNormalizado, correctNormalizado);
-    console.log(`📊 Similaridade entre respostas: ${(similaridade * 100).toFixed(1)}%`);
-    
-    // Reduzimos o limite para 45%
-    if (similaridade > 0.45) {
-      progressoUsuario.respostasCorretas++;
-      return "Correto! ✅ Sua resposta é similar à esperada. (verificado por similaridade)";
-    }
-    
-    return "Incorreto. ❌ A resposta correta seria: " + respostaCorreta;
+    return "Erro ao verificar a resposta. Por favor, tente novamente.";
   }
 }
 
@@ -1053,10 +1116,10 @@ async function gerarExplicacao(materia, nivel = 'iniciante') {
   switch(nivel) {
     case 'intermediario':
       profundidade = "Forneça uma explicação de nível intermediário, aprofundando nos conceitos. Inclua exemplos práticos e algumas aplicações.";
-      break;
+                break;
     case 'avancado':
       profundidade = "Forneça uma explicação avançada e detalhada, abordando aspectos complexos e nuances do tema. Inclua discussões sobre teoria, aplicações avançadas e tendências atuais.";
-      break;
+                break;
     case 'iniciante':
     default:
       profundidade = "Forneça uma explicação básica e introdutória, focando nos conceitos fundamentais e definições essenciais.";
@@ -1145,230 +1208,241 @@ async function gerarPerguntas(materia, explicacao, nivel = 'iniciante') {
 function gerarExplicacaoFallback(materia, nivel = 'iniciante') {
   console.log(`⚠️ Usando explicação fallback para ${materia} (nível ${nivel})`);
   
-  // Explicações específicas para matérias conhecidas
-  const explicacoesPadrao = {
-    'cdb e cdi': {
-      iniciante: `# CDB e CDI - Conceitos Básicos
+  const materiaFormatada = materia.toUpperCase().trim();
+  
+  // Verificar se a matéria contém CDB ou CDI (para casos como "CDB e CDI" ou "CDB/CDI")
+  if (materiaFormatada.includes('CDB')) {
+    if (nivel === 'iniciante') {
+      return `# Certificado de Depósito Bancário (CDB) - Nível Iniciante
 
-O CDB (Certificado de Depósito Bancário) é um título de renda fixa emitido por bancos. Quando você investe em um CDB, está emprestando dinheiro ao banco em troca de uma remuneração futura.
+O Certificado de Depósito Bancário (CDB) é um investimento de renda fixa emitido por bancos. Funciona como um empréstimo que você faz ao banco, e em troca, recebe juros pelo dinheiro emprestado.
 
-O CDI (Certificado de Depósito Interbancário) representa a taxa média das operações de empréstimos entre bancos. É a principal referência para investimentos de renda fixa no Brasil.
+## Características principais:
+- É considerado um investimento seguro
+- Possui proteção do FGC (Fundo Garantidor de Créditos) até R$ 250.000 por CPF e instituição financeira
+- A rentabilidade é definida no momento da aplicação
+- Pode ser prefixado (taxa fixa) ou pós-fixado (atrelado a um índice como CDI)
+- Possui tributação regressiva de Imposto de Renda (de 22,5% a 15%, dependendo do tempo de aplicação)
 
-Características principais do CDB:
-- Garantia do FGC (Fundo Garantidor de Créditos) de até R$ 250 mil por CPF e instituição financeira
-- Tributação regressiva de IR (de 22,5% a 15%, dependendo do prazo)
-- Rentabilidade geralmente expressa como % do CDI
+## Para quem é indicado:
+- Investidores iniciantes buscando segurança
+- Pessoas que querem uma alternativa melhor à poupança
+- Quem busca uma reserva de emergência com melhor rendimento`;
+    } else if (nivel === 'intermediario') {
+      return `# Certificado de Depósito Bancário (CDB) - Nível Intermediário
 
-Os CDBs podem ser:
-- Prefixados: taxa definida no momento da aplicação
-- Pós-fixados: atrelados a um indexador como CDI ou IPCA
-- Híbridos: combinam características dos dois tipos anteriores
+O CDB é um título de renda fixa emitido por bancos comerciais como forma de captação de recursos. Ao investir em CDB, você empresta dinheiro ao banco e recebe juros em troca.
 
-Para investidores iniciantes, CDBs são considerados seguros e oferecem rendimento superior à poupança.`,
+## Tipos de CDB:
+1. **CDB Prefixado**: A taxa de rentabilidade é definida no momento da aplicação
+2. **CDB Pós-fixado**: A rentabilidade está atrelada a um indexador, geralmente o CDI
+3. **CDB Híbrido**: Combina características dos dois anteriores, com parte prefixada e parte pós-fixada
 
-      intermediario: `# CDB e CDI - Análise Intermediária
-
-## Certificado de Depósito Bancário (CDB)
-O CDB é um instrumento de captação de recursos utilizado pelos bancos comerciais. Ao comprar um CDB, o investidor se torna credor da instituição financeira.
-
-### Tipos de CDB:
-1. **Prefixados**: Rentabilidade definida no momento da aplicação, independente das variações futuras das taxas de juros.
-2. **Pós-fixados**: Rentabilidade varia conforme um indexador (normalmente CDI).
-3. **Híbridos**: Combinam características prefixadas e pós-fixadas, como CDBs "IPCA + taxa prefixada".
-
-### Tributação:
-- IR regressivo de 22,5% a 15%, conforme prazo do investimento:
+## Tributação:
+- Imposto de Renda (tabela regressiva):
   - Até 180 dias: 22,5%
   - De 181 a 360 dias: 20%
   - De 361 a 720 dias: 17,5%
   - Acima de 720 dias: 15%
-- IOF regressivo para resgates antes de 30 dias
+- IOF: Incide sobre resgates em menos de 30 dias
 
-## Certificado de Depósito Interbancário (CDI)
-O CDI é um título de emissão das instituições financeiras para equilibrar liquidez entre bancos. Sua taxa serve como benchmark para o mercado de renda fixa.
+## Estratégias de investimento:
+- **Escalonamento de vencimentos**: Dividir o capital em CDBs com diferentes prazos
+- **Diversificação entre instituições**: Distribuir aplicações entre diferentes bancos para aumentar a cobertura do FGC
+- **Combinação com outros investimentos**: Usar CDBs como parte de uma carteira diversificada`;
+    } else if (nivel === 'avancado') {
+      return `# Certificado de Depósito Bancário (CDB) - Nível Avançado
 
-A taxa CDI acompanha de perto a taxa Selic, normalmente ficando um pouco abaixo. As diferenças ocorrem devido à dinâmica entre os bancos e às expectativas de mercado.
+O CDB é um instrumento de captação de recursos dos bancos, oferecendo ao investidor uma remuneração pelo capital emprestado à instituição financeira.
 
-### Características da liquidez:
-- Alguns CDBs permitem resgate antecipado (liquidez diária)
-- Outros só podem ser resgatados no vencimento
-- No resgate antecipado, aplica-se marcação a mercado, que pode resultar em rendimento menor que o esperado
+## Análise aprofundada:
 
-Os CDBs são uma ferramenta importante para diversificação em renda fixa e podem compor a parcela conservadora de uma carteira de investimentos.`,
+### Precificação e marcação a mercado:
+- O valor do CDB pode variar antes do vencimento conforme as condições de mercado
+- Em caso de resgate antecipado, o título passa pela marcação a mercado
+- A precificação considera o risco de crédito da instituição emissora
 
-      avancado: `# CDB e CDI - Análise Avançada
+### Fatores que influenciam a rentabilidade:
+- Rating da instituição financeira
+- Prazos de vencimento
+- Volume de aplicação
+- Cenário macroeconômico e política monetária
 
-## Precificação e Estruturação dos CDBs
-A precificação de CDBs é influenciada por diversos fatores macroeconômicos e específicos da instituição emissora:
+### CDBs estruturados:
+- São operações que combinam CDB tradicional com derivativos
+- Podem oferecer potencial de rentabilidade maior, mas com maior complexidade e risco
+- Geralmente possuem condições específicas para rentabilidade
 
-### Fatores Estruturais:
-1. **Basileia III**: O Acordo de Basileia III estabelece regras mais rígidas de capital e liquidez, influenciando diretamente o apetite dos bancos pela captação via CDB.
-2. **Rating da Instituição**: Bancos com classificação de risco inferior frequentemente oferecem CDBs com taxas mais elevadas para compensar o risco percebido.
-3. **Estratégia de Funding**: O mix de captação dos bancos (depósitos à vista, poupança, CDBs, LCAs, etc.) impacta a precificação de cada instrumento.
+### Estratégias avançadas:
+- Operações de arbitragem entre CDBs
+- Hedge com outros instrumentos financeiros
+- Análise de spread de crédito entre diferentes emissores
 
-### Marcação a Mercado (MtM):
-A MtM é fundamental para entender o valor de mercado de um CDB prefixado em caso de resgate antecipado. A relação entre taxas de juros e preço é inversamente proporcional:
-
-- Se as taxas de mercado sobem após a compra do CDB:
-  - O valor presente do título cai
-  - Em caso de resgate antecipado, o investidor pode ter rendimento inferior ao esperado
-
-- Se as taxas de mercado caem após a compra do CDB:
-  - O valor presente do título sobe
-  - Em caso de resgate antecipado, o investidor pode ter ganho adicional
-
-### Curva de Juros e Estrutura a Termo:
-A curva de juros futuros do CDI é essencial para a precificação de CDBs de longo prazo. A formatação da curva (normal, invertida ou flat) sinaliza as expectativas do mercado:
-
-- **Curva normal** (ascendente): Expectativa de alta das taxas de juros
-- **Curva invertida** (descendente): Expectativa de queda das taxas de juros
-- **Curva flat** (plana): Estabilidade esperada nas taxas
-
-### Estratégias Avançadas:
-- **Ladder (Escada) de CDBs**: Alocação em vários CDBs com vencimentos escalonados para reduzir risco de reinvestimento e aumentar liquidez
-- **Barbell**: Concentração em CDBs de curto e longo prazo, evitando prazos intermediários
-- **Bullet**: Concentração em um prazo específico alinhado com o horizonte de investimento
-
-### Comparação com Outros Instrumentos:
-- **Operações Compromissadas**: Oferecem liquidez imediata com lastro em títulos públicos, mas geralmente com rentabilidade inferior aos CDBs
-- **Debêntures**: Podem oferecer taxas superiores, mas com risco de crédito privado
-- **LCAs/LCIs**: Isentas de IR, mas com restrições de liquidez e, geralmente, taxas inferiores aos CDBs equivalentes
-
-O entendimento das nuances técnicas dos CDBs e CDI permite ao investidor sofisticado otimizar alocações, realizar operações estruturadas e aproveitar ineficiências pontuais de mercado.`
+### Considerações tributárias avançadas:
+- Impacto do come-cotas em fundos vs. CDBs
+- Estratégias de postergação fiscal
+- Otimização tributária em carteiras diversificadas`;
     }
-  };
-  
-  // Normalizar a matéria para busca case-insensitive
-  const materiaLower = materia.toLowerCase();
-  
-  // Se for uma matéria conhecida, retorna a explicação específica
-  for (const [chave, explicacoes] of Object.entries(explicacoesPadrao)) {
-    if (materiaLower.includes(chave) || chave.includes(materiaLower)) {
-      return explicacoes[nivel] || explicacoes['iniciante']; // Fallback para nível iniciante se o nível solicitado não existir
+  } else if (materiaFormatada.includes('CDI')) {
+    if (nivel === 'iniciante') {
+      return `# Certificado de Depósito Interbancário (CDI) - Nível Iniciante
+
+O CDI (Certificado de Depósito Interbancário) é uma taxa de juros utilizada nas operações entre bancos. Em termos simples, é a taxa que os bancos usam para emprestar dinheiro entre si por um dia.
+
+## Importância do CDI:
+- Serve como referência para diversos investimentos de renda fixa
+- Acompanha de perto a taxa Selic (taxa básica de juros da economia)
+- É utilizado para calcular a rentabilidade de vários produtos financeiros
+
+## Como afeta os investimentos:
+- Muitos investimentos são remunerados como um percentual do CDI (exemplo: 110% do CDI)
+- Quando o CDI sobe, a rentabilidade desses investimentos também aumenta
+- É considerado um bom parâmetro para avaliar se um investimento está oferecendo um retorno adequado
+
+## Para o investidor iniciante:
+- Ao avaliar um investimento, verifique quanto ele paga em relação ao CDI
+- Um investimento que paga 100% do CDI significa que sua rentabilidade será igual à taxa CDI
+- Percentuais acima de 100% do CDI significam que o investimento renderá mais que a taxa`;
+    } else if (nivel === 'intermediario') {
+      return `# Certificado de Depósito Interbancário (CDI) - Nível Intermediário
+
+O CDI é uma taxa de juros utilizada nas transações interbancárias, representando o custo dos empréstimos de curtíssimo prazo entre instituições financeiras.
+
+## Características técnicas do CDI:
+- É calculado diariamente pela B3 (antiga CETIP)
+- Reflete a média das taxas praticadas no mercado interbancário
+- Possui alta correlação com a taxa Selic, mas não são exatamente iguais
+- É expresso como taxa anual mas calculado diariamente (base 252 dias úteis)
+
+## Impacto nos investimentos:
+- A maioria dos fundos de renda fixa tem como benchmark o CDI
+- Investimentos pós-fixados como CDBs e LCIs/LCAs frequentemente usam o CDI como referência
+- A rentabilidade real (descontada a inflação) varia conforme o patamar do CDI
+
+## Estratégias de investimento baseadas no CDI:
+- Em cenários de CDI alto: favorecer investimentos pós-fixados
+- Em cenários de CDI baixo: considerar investimentos prefixados ou híbridos
+- Utilizar o CDI como referência para avaliar o prêmio de risco de outros investimentos
+
+## Cálculo prático:
+Para calcular o rendimento de um investimento a 110% do CDI quando o CDI está em 12% ao ano:
+- Rendimento = 12% × 110% = 13,2% ao ano`;
+    } else if (nivel === 'avancado') {
+      return `# Certificado de Depósito Interbancário (CDI) - Nível Avançado
+
+O CDI é um instrumento financeiro que representa a taxa média das operações de empréstimos de um dia entre instituições bancárias. Além de ser um instrumento de captação, o CDI atua como um importante benchmark para o mercado financeiro brasileiro.
+
+## Aspectos técnicos avançados:
+
+### Formação da taxa CDI:
+- Processo de apuração pela B3 através do sistema DI
+- Cálculo baseado na média ponderada das operações interbancárias
+- Relação entre variações no CDI e a política monetária do Banco Central
+- Impacto das decisões do COPOM sobre a trajetória da taxa
+
+### CDI e estruturação de produtos financeiros:
+- Uso do CDI como ativo subjacente em contratos de derivativos
+- Swaps DI x Pré e DI x IPCA: formação de preços e aplicações
+- Arbitragem entre mercados de juros futuros e CDI
+- Estratégias de imunização de carteiras usando o CDI como referência
+
+### Modelagem quantitativa:
+- Modelos de interpolação de curvas de juros
+- Cálculo de duration e convexidade em papéis referenciados em CDI
+- Precificação de ativos complexos com base na estrutura a termo do CDI
+- Análise de sensibilidade de carteiras a variações na curva de CDI
+
+### Aplicações em gestão de riscos:
+- VaR (Value at Risk) de carteiras expostas ao CDI
+- Stress testing considerando diferentes cenários para o CDI
+- Estratégias de hedge para riscos de taxa de juros`;
     }
   }
   
-  // Explicação genérica para matérias desconhecidas
-  switch(nivel) {
-    case 'intermediario':
-      return `# ${materia} - Nível Intermediário
-
-Esta é uma explicação de fallback para ${materia} em nível intermediário.
-
-Infelizmente, não foi possível gerar uma explicação personalizada para este tema. Recomendamos tentar novamente mais tarde ou escolher um tema mais específico.
-
-Enquanto isso, você pode consultar fontes confiáveis sobre ${materia} para aprofundar seus conhecimentos.`;
-      
-    case 'avancado':
-      return `# ${materia} - Nível Avançado
-
-Esta é uma explicação de fallback para ${materia} em nível avançado.
-
-Não foi possível gerar uma explicação personalizada detalhada para este tema. Recomendamos consultar literatura especializada ou tentar novamente mais tarde.
-
-Para estudos avançados em ${materia}, é recomendável buscar artigos científicos e publicações acadêmicas recentes.`;
-      
-    case 'iniciante':
-    default:
-      return `# ${materia} - Conceitos Básicos
-
-Esta é uma explicação básica de fallback para ${materia}.
-
-Infelizmente, não foi possível gerar uma explicação personalizada para este tema no momento. Recomendamos tentar novamente mais tarde.
-
-Para começar seus estudos em ${materia}, recomendamos buscar definições básicas e conceitos introdutórios em livros didáticos ou sites educacionais confiáveis.`;
-  }
+  return `Desculpe, não tenho uma explicação pré-definida para ${materia} no nível ${nivel}. Vamos prosseguir com as perguntas disponíveis.`;
 }
 
 // Função para gerar perguntas placeholder em caso de falha da API
 async function gerarPerguntasPlaceholder(materia, nivel = 'iniciante') {
     console.warn(`⚠️ Usando perguntas placeholder para: ${materia} (Nível: ${nivel})`);
     
+    const materiaFormatada = materia.toUpperCase().trim();
+    
     // Perguntas específicas para CDB e CDI
-    const perguntasEspecificas = {
-      'cdb e cdi': {
-        iniciante: [
-          { 
-            pergunta: "O que significa a sigla CDB?", 
-            respostaCorreta: "Certificado de Depósito Bancário" 
-          },
-          { 
-            pergunta: "Qual é a principal função do CDB?", 
-            respostaCorreta: "Captar recursos para os bancos, funcionando como um empréstimo do investidor para a instituição financeira" 
-          },
-          { 
-            pergunta: "O que o CDI representa no contexto de investimentos?", 
-            respostaCorreta: "É uma taxa de referência para investimentos de renda fixa, baseada nas operações entre bancos" 
-          },
-          { 
-            pergunta: "Se um CDB rende 110% do CDI e o CDI acumula 10% em um ano, quanto receberá um investidor que aplicou R$ 1.000?", 
-            respostaCorreta: "R$ 1.110" 
-          },
-          { 
-            pergunta: "Até que valor o CDB é garantido pelo FGC (Fundo Garantidor de Créditos)?", 
-            respostaCorreta: "Até R$ 250 mil por CPF e instituição financeira" 
-          }
-        ],
-        
-        intermediario: [
-          { 
-            pergunta: "Quais são os três tipos principais de CDBs quanto à forma de remuneração?", 
-            respostaCorreta: "Prefixados, pós-fixados e híbridos" 
-          },
-          { 
-            pergunta: "Como funciona a tributação de Imposto de Renda sobre o CDB para um investimento de 2 anos?", 
-            respostaCorreta: "Alíquota de 15% sobre o rendimento, conforme a tabela regressiva" 
-          },
-          { 
-            pergunta: "Qual é a relação entre a Taxa Selic e o CDI?", 
-            respostaCorreta: "O CDI normalmente acompanha de perto a Taxa Selic, sendo um pouco menor" 
-          },
-          { 
-            pergunta: "O que acontece com o rendimento de um CDB prefixado se a taxa Selic subir durante o período de investimento?", 
-            respostaCorreta: "O rendimento nominal permanece o mesmo, mas o rendimento real pode ficar menos atrativo comparado a novos investimentos" 
-          },
-          { 
-            pergunta: "Além do Imposto de Renda, que outro imposto pode incidir sobre resgates de CDB?", 
-            respostaCorreta: "IOF (Imposto sobre Operações Financeiras) para resgates antes de 30 dias" 
-          }
-        ],
-        
-        avancado: [
-          { 
-            pergunta: "Como a curva de juros do CDI influencia a precificação de CDBs de longo prazo?", 
-            respostaCorreta: "A curva de juros do CDI representa as taxas futuras esperadas, permitindo que os bancos precifiquem CDBs de longo prazo de acordo com as expectativas do mercado para as taxas de juros" 
-          },
-          { 
-            pergunta: "O que é a estratégia 'ladder' (escada) de CDBs e quais seus benefícios?", 
-            respostaCorreta: "É a distribuição de recursos em CDBs com diferentes vencimentos, permitindo reinvestimentos periódicos a novas taxas e melhor gerenciamento de liquidez" 
-          },
-          { 
-            pergunta: "Como as regras de Basileia III afetam a oferta e precificação de CDBs pelos bancos?", 
-            respostaCorreta: "As regras de Basileia III exigem índices de capital mais elevados, o que pode levar alguns bancos a oferecer CDBs com taxas mais atrativas para captar recursos e melhorar seus indicadores de liquidez" 
-          },
-          { 
-            pergunta: "Explique como funciona a marcação a mercado (MtM) em CDBs prefixados e seu impacto para o investidor em caso de resgate antecipado.", 
-            respostaCorreta: "Na marcação a mercado, CDBs prefixados são reavaliados diariamente conforme as taxas de mercado. Se as taxas subirem após a compra, o valor de mercado cai, gerando prejuízo em resgates antecipados. Se as taxas caírem, o valor de mercado sobe, gerando ganho adicional" 
-          },
-          { 
-            pergunta: "Qual a diferença entre uma operação compromissada e um CDB do ponto de vista da captação bancária?", 
-            respostaCorreta: "Nas operações compromissadas, o banco vende títulos com compromisso de recompra, oferecendo lastro; no CDB, o banco emite um título de dívida sem lastro específico. As compromissadas têm prazos geralmente mais curtos e tratamento contábil diferente nas instituições financeiras" 
-          }
-        ]
-      }
-    };
-    
-    // Normalizar a matéria para busca case-insensitive
-    const materiaLower = materia.toLowerCase();
-    
-    // Verificar se temos perguntas específicas para esta matéria
-    for (const [chave, perguntas] of Object.entries(perguntasEspecificas)) {
-      if (materiaLower.includes(chave) || chave.includes(materiaLower)) {
-        return perguntas[nivel] || perguntas['iniciante']; // Fallback para nível iniciante se o nível solicitado não existir
-      }
+    if (materiaFormatada.includes('CDB') || materiaFormatada.includes('CDI')) {
+        if (nivel === 'iniciante') {
+          return [
+            { 
+              pergunta: "O que significa a sigla CDB?", 
+              respostaCorreta: "Certificado de Depósito Bancário" 
+            },
+            { 
+              pergunta: "Qual é a principal função do CDB?", 
+              respostaCorreta: "Captar recursos para os bancos, funcionando como um empréstimo do investidor para a instituição financeira" 
+            },
+            { 
+              pergunta: "O que o CDI representa no contexto de investimentos?", 
+              respostaCorreta: "É uma taxa de referência para investimentos de renda fixa, baseada nas operações entre bancos" 
+            },
+            { 
+              pergunta: "Se um CDB rende 110% do CDI e o CDI acumula 10% em um ano, quanto receberá um investidor que aplicou R$ 1.000?", 
+              respostaCorreta: "R$ 1.110" 
+            },
+            { 
+              pergunta: "Até que valor o CDB é garantido pelo FGC (Fundo Garantidor de Créditos)?", 
+              respostaCorreta: "Até R$ 250 mil por CPF e instituição financeira" 
+            }
+          ];
+        } else if (nivel === 'intermediario') {
+          return [
+            { 
+              pergunta: "Quais são os três tipos principais de CDBs quanto à forma de remuneração?", 
+              respostaCorreta: "Prefixados, pós-fixados e híbridos" 
+            },
+            { 
+              pergunta: "Como funciona a tributação de Imposto de Renda sobre o CDB para um investimento de 2 anos?", 
+              respostaCorreta: "Alíquota de 15% sobre o rendimento, conforme a tabela regressiva" 
+            },
+            { 
+              pergunta: "Qual é a relação entre a Taxa Selic e o CDI?", 
+              respostaCorreta: "O CDI normalmente acompanha de perto a Taxa Selic, sendo um pouco menor" 
+            },
+            { 
+              pergunta: "O que acontece com o rendimento de um CDB prefixado se a taxa Selic subir durante o período de investimento?", 
+              respostaCorreta: "O rendimento nominal permanece o mesmo, mas o rendimento real pode ficar menos atrativo comparado a novos investimentos" 
+            },
+            { 
+              pergunta: "Além do Imposto de Renda, que outro imposto pode incidir sobre resgates de CDB?", 
+              respostaCorreta: "IOF (Imposto sobre Operações Financeiras) para resgates antes de 30 dias" 
+            }
+          ];
+        } else if (nivel === 'avancado') {
+          return [
+            { 
+              pergunta: "Como a curva de juros do CDI influencia a precificação de CDBs de longo prazo?", 
+              respostaCorreta: "A curva de juros do CDI representa as taxas futuras esperadas, permitindo que os bancos precifiquem CDBs de longo prazo de acordo com as expectativas do mercado para as taxas de juros" 
+            },
+            { 
+              pergunta: "O que é a estratégia 'ladder' (escada) de CDBs e quais seus benefícios?", 
+              respostaCorreta: "É a distribuição de recursos em CDBs com diferentes vencimentos, permitindo reinvestimentos periódicos a novas taxas e melhor gerenciamento de liquidez" 
+            },
+            { 
+              pergunta: "Como as regras de Basileia III afetam a oferta e precificação de CDBs pelos bancos?", 
+              respostaCorreta: "As regras de Basileia III exigem índices de capital mais elevados, o que pode levar alguns bancos a oferecer CDBs com taxas mais atrativas para captar recursos e melhorar seus indicadores de liquidez" 
+            },
+            { 
+              pergunta: "Explique como funciona a marcação a mercado (MtM) em CDBs prefixados e seu impacto para o investidor em caso de resgate antecipado.", 
+              respostaCorreta: "Na marcação a mercado, CDBs prefixados são reavaliados diariamente conforme as taxas de mercado. Se as taxas subirem após a compra, o valor de mercado cai, gerando prejuízo em resgates antecipados. Se as taxas caírem, o valor de mercado sobe, gerando ganho adicional" 
+            },
+            { 
+              pergunta: "Qual a diferença entre uma operação compromissada e um CDB do ponto de vista da captação bancária?", 
+              respostaCorreta: "Nas operações compromissadas, o banco vende títulos com compromisso de recompra, oferecendo lastro; no CDB, o banco emite um título de dívida sem lastro específico. As compromissadas têm prazos geralmente mais curtos e tratamento contábil diferente nas instituições financeiras" 
+            }
+          ];
+        }
     }
     
-    // Se não encontrou perguntas específicas, usa perguntas genéricas
+    // Para outras matérias, usamos perguntas genéricas
     let perguntas;
     switch(nivel) {
       case 'intermediario':
@@ -1379,7 +1453,7 @@ async function gerarPerguntasPlaceholder(materia, nivel = 'iniciante') {
           { pergunta: `Desafios encontrados no estudo de ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder interm. 4" },
           { pergunta: `Métodos utilizados para pesquisa em ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder interm. 5" }
         ];
-        break;
+                break;
       case 'avancado':
         perguntas = [
           { pergunta: `Problemas complexos em ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 1" },
@@ -1388,9 +1462,9 @@ async function gerarPerguntasPlaceholder(materia, nivel = 'iniciante') {
           { pergunta: `Casos avançados de aplicação de ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 4" },
           { pergunta: `Integração de ${materia} com tecnologias emergentes? (Placeholder)`, respostaCorreta: "Resposta placeholder avanç. 5" }
         ];
-        break;
+                break;
       case 'iniciante':
-      default:
+              default:
         perguntas = [
           { pergunta: `O que é ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder iniciante 1" },
           { pergunta: `Quando surgiu ${materia}? (Placeholder)`, respostaCorreta: "Resposta placeholder iniciante 2" },
@@ -1514,7 +1588,7 @@ async function processarResposta(jid, texto, isGroup) {
           // Envia a primeira pergunta do novo nível após delay
           await delay(2000);
           await enviarProximaPergunta(jid, isGroup);
-        } catch (error) {
+    } catch (error) {
           console.error(`❌ Erro ao processar avanço de nível:`, error);
           await enviarMensagemComDelay(jid, { text: `Houve um problema ao avançar para o nível ${nivelAtual}. Por favor, reinicie o estudo.` }, isGroup);
           delete estadoConversa[jid];
@@ -1639,3 +1713,11 @@ async function processarResposta(jid, texto, isGroup) {
 iniciarConexaoWhatsApp().then(() => {
   app.listen(3000, () => console.log("Servidor rodando na porta 3000!"));
 });
+
+// Exportar variáveis e funções importantes para testes e integração
+module.exports = {
+  OPENROUTER_API_KEY,
+  chamarOpenRouter,
+  gerarExplicacaoFallback,
+  gerarPerguntasPlaceholder
+};
